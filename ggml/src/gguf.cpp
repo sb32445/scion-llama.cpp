@@ -710,6 +710,16 @@ static struct gguf_context * gguf_init_from_reader(const struct gguf_reader & gr
         {
             ok = ok && gr.read(info.t.type);
 
+            // Legacy fork import: CodeMasterCody3D's Q1_0_g128 (type id 43) is
+            // byte-identical to Prism's PQ2_0: fp16 scale + 2-bit codes per 128
+            // weights, codes {0,1,2} -> {-1,0,+1}. Their fourth state (11 -> +2)
+            // is a superset we never emit, so importing 43 as PQ2_0 reproduces
+            // those tensors bit-for-bit without a repack. Prism reserves ids
+            // 43..141, so 43 cannot collide with a Prism-native file.
+            if (info.t.type == (enum ggml_type) 43) {
+                info.t.type = GGML_TYPE_PQ2_0;
+            }
+
             // check that tensor type is within defined range
             if (info.t.type < 0 || info.t.type >= GGML_TYPE_COUNT) {
                 GGML_LOG_ERROR("%s: tensor '%s' has invalid ggml type %d. should be in [0, %d)\n",
