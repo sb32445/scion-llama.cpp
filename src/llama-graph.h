@@ -1184,6 +1184,12 @@ struct llm_graph_context {
               ggml_tensor * cur,
               ggml_tensor * w_s = nullptr) const;
 
+    // lora-only branch with no base tensor (e.g. the MoE block-output
+    // correction); returns nullptr when no adapter provides the name
+    ggml_tensor * build_lora_branch(
+              const char  * name,
+              ggml_tensor * cur) const;
+
     // do mat_mul_id, while optionally apply lora and per-expert scale
     ggml_tensor * build_lora_mm_id(
               ggml_tensor * w,   // ggml_tensor * as

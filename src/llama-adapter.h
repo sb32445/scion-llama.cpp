@@ -71,6 +71,10 @@ struct llama_adapter_lora {
 
     float alpha;
 
+    // TAARDIS: adapter trained on the block-Hadamard-rotated activation; on
+    // rotation-mapped weights it is fed the rotated input (see build_lora_mm)
+    bool  rotated_basis = false;
+
     // gguf metadata
     std::unordered_map<std::string, std::string> gguf_kv;
 
@@ -81,6 +85,13 @@ struct llama_adapter_lora {
     ~llama_adapter_lora() = default;
 
     llama_adapter_lora_weight * get_weight(ggml_tensor * w);
+
+    // TAARDIS: virtual targets. `blk.N.ssm_readout` and
+    // `blk.N.ffn_moe_out.weight` have no base-model tensor: they are
+    // low-rank corrections on an ACTIVATION, looked up by name from the
+    // graph. Their tensors borrow the buffer type of an anchor tensor of the
+    // same layer so the correction runs where the layer runs.
+    llama_adapter_lora_weight * get_weight_named(const std::string & name);
 
     uint32_t get_n_nodes() const {
         return ab_map.size() * 6u; // a, b, scale, add, 2 x mul_mat

@@ -146,6 +146,36 @@ llama_adapter_lora_weight * llama_adapter_lora::get_weight(ggml_tensor * w) {
     return nullptr;
 }
 
+llama_adapter_lora_weight * llama_adapter_lora::get_weight_named(const std::string & name) {
+    const auto pos = ab_map.find(name);
+    return pos != ab_map.end() ? &pos->second : nullptr;
+}
+
+// TAARDIS virtual LoRA targets: adapter pairs that correct an ACTIVATION rather than a weight.
+// `blk.N.ssm_readout`        -> the DeltaNet recurrent readout of layer N (anchor: ssm_norm)
+// `blk.N.ffn_moe_out.weight` -> the MoE block output of layer N (anchor: ffn_gate_inp)
+// The anchor supplies the device so the correction runs where the layer runs.
+static bool taardis_ends_with(const std::string & s, const std::string & suffix) {
+    return s.size() >= suffix.size() && s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+static bool taardis_virtual_target(const std::string & name) {
+    return taardis_ends_with(name, ".ssm_readout") ||
+           taardis_ends_with(name, ".ffn_moe_out.weight");
+}
+
+static const ggml_tensor * taardis_virtual_anchor(const llama_model & model, const std::string & name) {
+    if (taardis_ends_with(name, ".ssm_readout")) {
+        // blk.N.ssm_readout -> blk.N.ssm_norm.weight
+        return model.get_tensor((name.substr(0, name.size() - std::string("ssm_readout").size()) + "ssm_norm.weight").c_str());
+    }
+    if (taardis_ends_with(name, ".ffn_moe_out.weight")) {
+        // blk.N.ffn_moe_out.weight -> blk.N.ffn_gate_inp.weight
+        return model.get_tensor((name.substr(0, name.size() - std::string("ffn_moe_out.weight").size()) + "ffn_gate_inp.weight").c_str());
+    }
+    return nullptr;
+}
+
 static void llama_adapter_lora_init_impl(llama_model & model, const char * path_lora, llama_adapter_lora & adapter) {
     LLAMA_LOG_INFO("%s: loading lora adapter from '%s' ...\n", __func__, path_lora);
 
@@ -210,12 +240,25 @@ static void llama_adapter_lora_init_impl(llama_model & model, const char * path_
             throw std::runtime_error("model arch and LoRA arch mismatch");
         }
 
-        auto adapter_type = get_kv_str(llm_kv(LLM_KV_ADAPTER_TYPE));
-        if (adapter_type != "lora") {
-            throw std::runtime_error("expect adapter.type to be 'lora', but got: " + adapter_type);
+        const auto adapter_type = get_kv_str(llm_kv(LLM_KV_ADAPTER_TYPE));
+        const bool taardis_type = adapter_type == "taardis-lora";
+        if (adapter_type != "lora" && !taardis_type) {
+            throw std::runtime_error("expect adapter.type to be 'lora' or 'taardis-lora', but got: " + adapter_type);
         }
 
         adapter.alpha = get_kv_f32(llm_kv(LLM_KV_ADAPTER_LORA_ALPHA));
+
+        // TAARDIS: adapters trained in the block-Hadamard basis declare it, either through the
+        // type tag or an explicit boolean. They are fed the rotated activation on
+        // rotation-mapped weights (see llm_graph_context::build_lora_mm).
+        {
+            const int rb = gguf_find_key(gguf_ctx, "adapter.taardis.rotated_basis");
+            const bool rb_set = rb >= 0 && gguf_get_kv_type(gguf_ctx, rb) == GGUF_TYPE_BOOL && gguf_get_val_bool(gguf_ctx, rb);
+            adapter.rotated_basis = taardis_type || rb_set;
+            if (adapter.rotated_basis) {
+                LLAMA_LOG_INFO("%s: adapter declares rotated_basis -> fed the rotated activation on rotation-mapped tensors\n", __func__);
+            }
+        }
 
         // parse alora invocation sequence vector
         const auto & key = llm_kv(LLM_KV_ADAPTER_ALORA_INVOCATION_TOKENS);
@@ -327,7 +370,9 @@ static void llama_adapter_lora_init_impl(llama_model & model, const char * path_
         }
 
         // device buft and device ctx
-        const auto * model_tensor = model.get_tensor(name.c_str());
+        const bool is_virtual = taardis_virtual_target(name);
+        const bool is_moe_corr = taardis_ends_with(name, ".ffn_moe_out.weight");
+        const auto * model_tensor = is_virtual ? taardis_virtual_anchor(model, name) : model.get_tensor(name.c_str());
         if (!model_tensor) {
             throw std::runtime_error("LoRA tensor '" + name + "' does not exist in base model (hint: maybe wrong base model?)");
         }
@@ -337,7 +382,7 @@ static void llama_adapter_lora_init_impl(llama_model & model, const char * path_
         // do not load loras to extra buffer types (i.e. bufts for repacking) -> use the CPU in that case
         for (auto & ex : buft_extra) {
             if (ex == buft) {
-                LLAMA_LOG_WARN("%s: lora for '%s' cannot use buft '%s', fallback to CPU\n", __func__, model_tensor->name, ggml_backend_buft_name(buft));
+                LLAMA_LOG_WARN("%s: lora for '%s' cannot use buft '%s', fallback to CPU\n", __func__, name.c_str(), ggml_backend_buft_name(buft));
 
                 auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
                 if (!cpu_dev) {
@@ -349,11 +394,27 @@ static void llama_adapter_lora_init_impl(llama_model & model, const char * path_
             }
         }
 
-        LLAMA_LOG_DEBUG("%s: lora for '%s' -> '%s'\n", __func__, model_tensor->name, ggml_backend_buft_name(buft));
+        LLAMA_LOG_DEBUG("%s: lora for '%s' -> '%s'\n", __func__, name.c_str(), ggml_backend_buft_name(buft));
 
         ggml_context * dev_ctx = ctx_for_buft(buft);
         // validate tensor shape
-        if (is_token_embd) {
+        if (is_moe_corr) {
+            // moe block-output correction: a = [n_embd, rank], b = [rank, n_embd]
+            const int64_t n_embd = model.hparams.n_embd;
+            if (w.a->ne[0] != n_embd || w.b->ne[1] != n_embd) {
+                throw std::runtime_error("moe correction tensor '" + name + "' has incorrect shape (expected n_embd " + std::to_string(n_embd) + ")");
+            }
+            if (w.a->ne[1] != w.b->ne[0]) {
+                throw std::runtime_error("lora_a tensor is not transposed (hint: adapter from \"finetune\" example is no longer supported)");
+            }
+        } else if (is_virtual) {
+            // readout: a = B [head_dim, rank, n_heads], b = A [rank, head_dim, n_heads]; head_dim == ssm_norm width
+            const int64_t hd = model_tensor->ne[0];
+            if (w.a->ne[0] != hd || w.b->ne[1] != hd || w.a->ne[1] != w.b->ne[0] || w.a->ne[2] != w.b->ne[2] || w.a->ne[2] < 1) {
+                throw std::runtime_error("tensor '" + name + "' has incorrect shape: expect lora_a [head_dim, rank, n_heads] and lora_b [rank, head_dim, n_heads] with head_dim " + std::to_string(hd));
+            }
+            LLAMA_LOG_INFO("%s: TAARDIS readout branch '%s': %lld heads x %lld dims, rank %lld\n", __func__, name.c_str(), (long long) w.a->ne[2], (long long) hd, (long long) w.a->ne[1]);
+        } else if (is_token_embd) {
             // expect B to be non-transposed, A and B are flipped; see llm_build_inp_embd()
             if (model_tensor->ne[0] != w.b->ne[1] || model_tensor->ne[1] != w.a->ne[1]) {
                 throw std::runtime_error("tensor '" + name + "' has incorrect shape (hint: maybe wrong base model?)");

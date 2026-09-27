@@ -2282,6 +2282,11 @@ struct llama_model_qwen35 : public llama_model_base {
                     ggml_tensor * cur,
                             int   il);
 
+        // TAARDIS: per-head low-rank correction on the DeltaNet recurrent readout (adapter `blk.N.ssm_readout`)
+        ggml_tensor * build_readout_branch(
+                    ggml_tensor * o,
+                            int   il);
+
         ggml_tensor * build_layer_ffn(
                     ggml_tensor * cur,
                             int   il);

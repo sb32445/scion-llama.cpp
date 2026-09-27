@@ -1,5 +1,7 @@
 #include "models.h"
 
+#include <string>
+
 void llama_model_olmoe::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
 
@@ -134,7 +136,8 @@ llama_model_olmoe::graph::graph(const llama_model & model, const llm_graph_param
                 LLM_NORM_RMS, il);
         cb(cur, "ffn_norm", il);
 
-        cur = build_moe_ffn(cur,
+        ggml_tensor * moe_in = cur;
+        cur = build_moe_ffn(moe_in,
                 model.layers[il].ffn_gate_inp,
                 model.layers[il].ffn_up_exps,
                 model.layers[il].ffn_gate_exps,
@@ -146,6 +149,15 @@ llama_model_olmoe::graph::graph(const llama_model & model, const llm_graph_param
                 LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
                 il);
         cb(cur, "ffn_moe_out", il);
+
+        // optional correction branch on the MoE block output (adapter sidecar)
+        {
+            const std::string corr = "blk." + std::to_string(il) + ".ffn_moe_out.weight";
+            ggml_tensor * branch = build_lora_branch(corr.c_str(), moe_in);
+            if (branch) {
+                cur = ggml_add(ctx0, cur, branch);
+            }
+        }
 
         cur = ggml_add(ctx0, cur, ffn_inp);
 

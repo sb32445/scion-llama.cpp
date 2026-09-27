@@ -3,6 +3,8 @@
 #include "llama-memory-recurrent.h"
 #include "llama-kv-cache.h"
 
+#include <string>
+
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
     ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS,    hparams.rope_sections, 4, true);
@@ -321,6 +323,31 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35::graph::build_qkvz(
     return { qkv_mixed, z };
 }
 
+ggml_tensor * llama_model_qwen35::graph::build_readout_branch(ggml_tensor * o, int il) {
+    // o: [head_dim, n_heads, n_tokens, n_seqs]
+    const std::string name = "blk." + std::to_string(il) + ".ssm_readout";
+    ggml_tensor * res = o;
+    for (const auto & lora : *loras) {
+        llama_adapter_lora_weight * lw = lora.first->get_weight_named(name);
+        if (lw == nullptr) {
+            continue;
+        }
+        GGML_ASSERT(lw->a->ne[0] == o->ne[0] && lw->a->ne[2] == o->ne[1] && "readout branch head geometry mismatch");
+        const float scale = lw->get_scale(lora.first->alpha, lora.second);
+        // batch the heads: [head_dim, n_tokens, n_heads, n_seqs] so mul_mat broadcasts a=[head_dim, rank, n_heads]
+        ggml_tensor * ot  = ggml_cont(ctx0, ggml_permute(ctx0, o, 0, 2, 1, 3));
+        ggml_tensor * lat = ggml_mul_mat(ctx0, lw->a, ot);                 // [rank, n_tokens, n_heads, n_seqs]
+        ggml_tensor * cor = ggml_mul_mat(ctx0, lw->b, lat);                // [head_dim, n_tokens, n_heads, n_seqs]
+        cor = ggml_cont(ctx0, ggml_permute(ctx0, cor, 0, 2, 1, 3));        // back to [head_dim, n_heads, n_tokens, n_seqs]
+        if (scale != 1.0f) {
+            cor = ggml_scale(ctx0, cor, scale);
+        }
+        res = ggml_add(ctx0, res, cor);
+        cb(res, "ssm_readout_branch", il);
+    }
+    return res;
+}
+
 ggml_tensor * llama_model_qwen35::graph::build_norm_gated(
         ggml_tensor * input,
         ggml_tensor * weights,
@@ -583,6 +610,12 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
 
     ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il,
             gdn_state_rows ? inp->s_copy_main : nullptr);
+
+    // TAARDIS: per-head low-rank correction on the recurrent READOUT, o' = o + A_h(B_h o), applied
+    // BEFORE the gated norm -- the same tensor the PyTorch trainer hooks (mixer.norm pre-hook). One
+    // site covers prefill (chunked) and decode (autoregressive): both come out of build_recurrent_attn.
+    // Absent from the adapter -> nothing is added (bit-identical to today).
+    output = build_readout_branch(output, il);
 
     // z: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * n_tokens * n_seqs, head_dim]
     ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);

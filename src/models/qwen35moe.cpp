@@ -1,6 +1,8 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
 
+#include <string>
+
 void llama_model_qwen35moe::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp, false);
     ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
@@ -502,6 +504,9 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
     // Check if this is an MoE layer
     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
 
+    // TAARDIS: correction branch input (normalized block input; see the hook below)
+    ggml_tensor * ffn_in = cur;
+
     ggml_tensor * moe_out =
         build_moe_ffn(cur,
             model.layers[il].ffn_gate_inp,
@@ -549,6 +554,15 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
         cb(cur, "ffn_out", il);
     } else {
         cur = moe_out;
+    }
+
+    // optional correction branch on the MoE block output (adapter sidecar)
+    {
+        const std::string corr = "blk." + std::to_string(il) + ".ffn_moe_out.weight";
+        ggml_tensor * branch = build_lora_branch(corr.c_str(), ffn_in);
+        if (branch) {
+            cur = ggml_add(ctx0, cur, branch);
+        }
     }
 
     return cur;
