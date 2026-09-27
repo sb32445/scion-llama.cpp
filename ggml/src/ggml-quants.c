@@ -2270,8 +2270,10 @@ size_t quantize_q2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, 
 
 size_t quantize_pq2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
     const bool lloyd = ggml_pq2_0_lloyd_enabled();
-    if (lloyd) {
+    static bool lloyd_logged = false;
+    if (lloyd && !lloyd_logged) {
         GGML_LOG_INFO("%s: GGML_PQ2_0_LLOYD=1 -> using the Lloyd-Max scale rule\n", __func__);
+        lloyd_logged = true;
     }
     if (!quant_weights) {
         if (lloyd) {
