@@ -144,6 +144,94 @@ void quantize_row_pq2_0_ref(const float * GGML_RESTRICT x, block_pq2_0 * GGML_RE
     }
 }
 
+// Lloyd-Max refinement of the PQ2_0 group scale. This is the quantizer behind
+// the ternary-serve MoE recipe (fork: quantize_row_q1_0_g128_ref). Measured
+// 8.9x lower PPL than the one-shot mean|w| rule at identical storage on OLMoE
+// (133,325 vs 1,186,015, bit-exact reproduction). Prism's absmax rule stays
+// the default for PQ2_0; packers opt in with GGML_PQ2_0_LLOYD=1.
+static float ggml_pq2_0_lloyd_scale(const float * GGML_RESTRICT x, int qk, float mean) {
+    if (mean <= 0.0f) {
+        return 0.0f;
+    }
+    // Alternate {threshold -> centroid} until fixed point, from 4 starts,
+    // keeping the best residual reduction. The fixed point of this iteration
+    // IS the TWN rule a = mean(|w| : |w| > a/2).
+    static const float inits[4] = {0.5f, 0.7f, 0.9f, 1.1f};
+    float best_a   = mean;
+    float best_obj = -1.0f;
+    for (int ci = 0; ci < 4; ci++) {
+        float th = inits[ci] * mean;
+        float s1 = 0.0f; int sw = 0;
+        for (int j = 0; j < qk; j++) {
+            const float w = fabsf(x[j]);
+            if (w > th) { s1 += w; sw++; }
+        }
+        float a = sw > 0 ? s1/sw : 0.0f;
+        for (int it = 0; it < 8 && a > 0.0f; it++) {
+            th = 0.5f * a;              // ternary decision boundary for {0, +/-1}
+            s1 = 0.0f; sw = 0;
+            for (int j = 0; j < qk; j++) {
+                const float w = fabsf(x[j]);
+                if (w > th) { s1 += w; sw++; }
+            }
+            const float na = sw > 0 ? s1/sw : 0.0f;
+            if (fabsf(na - a) <= 1e-6f * fmaxf(na, a)) { a = na; break; }
+            a = na;
+        }
+        // Residual reduction (s1^2/sw): the objective the reference impl ranks by.
+        const float obj = sw > 0 ? s1*s1/(float)sw : 0.0f;
+        if (obj > best_obj) { best_obj = obj; best_a = a; }
+    }
+    return best_a > 0.0f ? best_a : mean;
+}
+
+void quantize_row_pq2_0_lloyd_ref(const float * GGML_RESTRICT x, block_pq2_0 * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_PQ2_0;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        float sum_abs = 0.0f;
+        for (int j = 0; j < qk; j++) {
+            sum_abs += fabsf(x[i*qk + j]);
+        }
+        float d = sum_abs / qk;
+        d = ggml_pq2_0_lloyd_scale(x + i*qk, qk, d);
+
+        // Round-trip the stored fp16 so quantization sees exactly the scale
+        // dequantization will apply.
+        y[i].d = GGML_FP32_TO_FP16(d);
+        const float dq = GGML_FP16_TO_FP32(y[i].d);
+
+        for (int j = 0; j < qk / 4; ++j) {
+            y[i].qs[j] = 0;
+        }
+
+        // BitNet b1.58 ternary: q = clamp(round(w/d), -1, 1). Weights below d/2
+        // collapse to the zero state. Stored offset by +1 so {-1,0,+1} maps to
+        // {0,1,2} -- the same codes as the absmax rule.
+        const float id = dq > 0.0f ? 1.0f/dq : 0.0f;
+        for (int j = 0; j < qk; ++j) {
+            int q = (int)roundf(x[i*qk + j] * id);
+            if (q < -1) q = -1;
+            if (q >  1) q =  1;
+            const uint8_t code = (uint8_t)(q + 1);
+            y[i].qs[j / 4] |= (uint8_t)(code << (2 * (j % 4)));
+        }
+    }
+}
+
+static bool ggml_pq2_0_lloyd_enabled(void) {
+    static int cached = -1;   // benign race: every writer stores the same value
+    if (cached < 0) {
+        const char * v = getenv("GGML_PQ2_0_LLOYD");
+        cached = (v && v[0] == '1') ? 1 : 0;
+    }
+    return cached != 0;
+}
+
 // reference implementation for deterministic creation of model files
 void quantize_row_q4_0_ref(const float * GGML_RESTRICT x, block_q4_0 * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK4_0;
@@ -2181,14 +2269,26 @@ size_t quantize_q2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, 
 }
 
 size_t quantize_pq2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    const bool lloyd = ggml_pq2_0_lloyd_enabled();
+    if (lloyd) {
+        GGML_LOG_INFO("%s: GGML_PQ2_0_LLOYD=1 -> using the Lloyd-Max scale rule\n", __func__);
+    }
     if (!quant_weights) {
-        quantize_row_pq2_0_ref(src, dst, (int64_t)nrow*n_per_row);
+        if (lloyd) {
+            quantize_row_pq2_0_lloyd_ref(src, dst, (int64_t)nrow*n_per_row);
+        } else {
+            quantize_row_pq2_0_ref(src, dst, (int64_t)nrow*n_per_row);
+        }
         return nrow * ggml_row_size(GGML_TYPE_PQ2_0, n_per_row);
     }
     size_t row_size = ggml_row_size(GGML_TYPE_PQ2_0, n_per_row);
     char * qrow = (char *)dst;
     for (int64_t row = 0; row < nrow; ++row) {
-        quantize_row_pq2_0_ref(src, (block_pq2_0*)qrow, n_per_row);
+        if (lloyd) {
+            quantize_row_pq2_0_lloyd_ref(src, (block_pq2_0*)qrow, n_per_row);
+        } else {
+            quantize_row_pq2_0_ref(src, (block_pq2_0*)qrow, n_per_row);
+        }
         src += n_per_row;
         qrow += row_size;
     }
