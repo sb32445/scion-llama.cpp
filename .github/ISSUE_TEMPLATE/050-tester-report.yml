@@ -1,0 +1,67 @@
+name: Tester report — ternary 35B release
+description: Report your experience running qwen35-release.gguf (ternary PQ2_0 + embedded corrections)
+title: "[tester] <backend> / <GPU> — <one-line summary>"
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing! Please fill what you can — partial reports are useful.
+        The file: `qwen35-release.gguf` (11.34 GB, sha256 `545d83a9…`).
+        Runtime: this fork, branch `moe-corr-runtime` (adds the PQ2_0 container and embedded adapters).
+  - type: input
+    id: hardware
+    attributes:
+      label: Hardware
+      description: GPU(s), VRAM, CPU, RAM
+      placeholder: "e.g. RTX 4090 24GB / 7800X3D / 64GB"
+    validations:
+      required: true
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Backend
+      options:
+        - CUDA
+        - ROCm
+        - CPU
+        - Metal
+        - other
+    validations:
+      required: true
+  - type: input
+    id: build
+    attributes:
+      label: Build / commit
+      description: Prebuilt binary or your own build, and the commit you built
+      placeholder: "e.g. built moe-corr-runtime @ aa96b8c12, cmake -DGGML_CUDA=ON"
+  - type: input
+    id: speed
+    attributes:
+      label: Speed
+      description: pp512 / tg128 t/s, context size, threads, any -ncmoe / offload settings
+      placeholder: "e.g. pp512 800 t/s, tg 45 t/s, -c 4096, -t 8, no offload"
+  - type: textarea
+    id: comparison
+    attributes:
+      label: Comparison to your usual quant
+      description: Same prompts/tasks against whatever you normally run (Q4_K_M, IQ2_M, …)
+  - type: textarea
+    id: coherence
+    attributes:
+      label: Coherence over long chats
+      description: Does it stay coherent? Where does it derail?
+  - type: textarea
+    id: failures
+    attributes:
+      label: Failure shapes
+      description: Repetition, factual slips, formatting/JSON collapse, language drift, tool-call issues
+  - type: textarea
+    id: load
+    attributes:
+      label: Load / portability problems
+      description: Any load errors, wrong output, crashes, missing tensors — paste the log
+  - type: textarea
+    id: anything
+    attributes:
+      label: Anything else
