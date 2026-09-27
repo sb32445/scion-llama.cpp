@@ -713,6 +713,22 @@ llama_model_loader::llama_model_loader(
     n_kv      = gguf_get_n_kv(metadata);
     n_tensors = weights_map.size();
 
+    // single-file release: .lora_a/.lora_b tensors embedded in the model file are
+    // loaded by the adapter loader; do not count them as model tensors
+    if (gguf_find_key(metadata, "adapter.embedded") >= 0) {
+        auto ends_with = [](const std::string & s, const std::string & suffix) {
+            return s.size() >= suffix.size() && s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+        };
+        for (const auto & kv : weights_map) {
+            const std::string & name = kv.first;
+            if (ends_with(name, ".lora_a") || ends_with(name, ".lora_b")) {
+                n_tensors_adapters++;
+            }
+        }
+        LLAMA_LOG_INFO("%s: model embeds an adapter: %d of %d tensors are adapter tensors\n",
+                __func__, n_tensors_adapters, n_tensors);
+    }
+
     fver = (enum llama_fver) gguf_get_version(metadata);
 
     LLAMA_LOG_INFO("%s: loaded meta data with %d key-value pairs and %d tensors from %s (version %s)\n",
@@ -1345,15 +1361,18 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 }
 
 void llama_model_loader::done_getting_tensors(bool partial) const {
-    if (n_created > n_tensors) {
-        throw std::runtime_error(format("%s: too many tensors created; expected %d, got %d", __func__, n_tensors, n_created));
+    // embedded-adapter tensors are loaded by the adapter loader, not by the model
+    const int n_model_tensors = n_tensors - n_tensors_adapters;
+
+    if (n_created > n_model_tensors) {
+        throw std::runtime_error(format("%s: too many tensors created; expected %d, got %d", __func__, n_model_tensors, n_created));
     }
-    if (n_created < n_tensors) {
+    if (n_created < n_model_tensors) {
         if (!partial) {
-            throw std::runtime_error(format("%s: wrong number of tensors; expected %d, got %d", __func__, n_tensors, n_created));
+            throw std::runtime_error(format("%s: wrong number of tensors; expected %d, got %d", __func__, n_model_tensors, n_created));
         }
         LLAMA_LOG_INFO("%s: partial load — used %d of %d tensors in the file (rest belong to a sibling model on the same .gguf)\n",
-                __func__, n_created, n_tensors);
+                __func__, n_created, n_model_tensors);
     }
     if (n_tensors_moved > 0) {
         LLAMA_LOG_DEBUG("%s: tensor '%s' (%s) (and %zu others) cannot be used with preferred buffer type %s, using %s instead\n",

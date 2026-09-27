@@ -1668,16 +1668,30 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 void llama_context::set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales) {
     LLAMA_LOG_DEBUG("%s: adapters = %p\n", __func__, (void *) adapters);
 
-    if (adapters_lora_are_same(adapters, n_adapters, scales)) {
+    // the model's embedded adapter (single-file release), if any, is always applied at scale 1.0
+    std::vector<llama_adapter_lora *> all_adapters;
+    std::vector<float> all_scales;
+
+    if (model.internal_lora != nullptr) {
+        all_adapters.push_back(model.internal_lora);
+        all_scales.push_back(1.0f);
+    }
+
+    for (size_t i = 0; i < n_adapters; i ++) {
+        if (scales[i] != 0.0f) {
+            all_adapters.push_back(adapters[i]);
+            all_scales.push_back(scales[i]);
+        }
+    }
+
+    if (adapters_lora_are_same(all_adapters.data(), all_adapters.size(), all_scales.data())) {
         return;
     }
 
     loras.reset(new llama_adapter_loras());
 
-    for (size_t i = 0; i < n_adapters; i ++) {
-        if (scales[i] != 0.0f) {
-            loras->insert({adapters[i], scales[i]});
-        }
+    for (size_t i = 0; i < all_adapters.size(); i ++) {
+        loras->insert({all_adapters[i], all_scales[i]});
     }
 
     sched_need_reserve = true;

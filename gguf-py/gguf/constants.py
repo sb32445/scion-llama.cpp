@@ -5477,6 +5477,9 @@ class GGMLQuantizationType(IntEnum):
     Q1_0    = 41
     Q2_0    = 42
     PQ2_0   = 142
+    # legacy id of PQ2_0: CodeMasterCody3D's Q1_0_g128 port wrote type 43; the
+    # layout is byte-identical (the C++ loader imports 43 as PQ2_0 as well)
+    Q1_0_g128 = 43
     PTQ1_0  = 143
 
 
@@ -5673,6 +5676,7 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.Q1_0:    (128, 2 + 16),
     GGMLQuantizationType.Q2_0:    (64, 2 + 16),
     GGMLQuantizationType.PQ2_0:   (128, 2 + 32),
+    GGMLQuantizationType.Q1_0_g128: (128, 2 + 32),
     GGMLQuantizationType.PTQ1_0:  (128, 2 + 24 + 2),
 }
 

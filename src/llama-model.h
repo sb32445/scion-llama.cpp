@@ -730,6 +730,10 @@ struct llama_model {
     // for keeping track of associated LoRA adapters
     std::unordered_set<llama_adapter_lora *> loras;
 
+    // TAARDIS: adapter embedded in the model file itself (single-file release).
+    // Owned via `loras`; auto-applied by every context.
+    llama_adapter_lora * internal_lora = nullptr;
+
     // statically allocated context for assigning
     struct llama_meta_device_get_split_state_userdata get_split_state_ud;
 

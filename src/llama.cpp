@@ -367,6 +367,23 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             return {-2, nullptr};
         }
 
+        // single-file release: attach an adapter embedded in the model file so that
+        // every context applies its corrections without an explicit --lora argument
+        {
+            bool embedded = false;
+            ml.get_key("adapter.embedded", embedded, /*required*/ false);
+            if (embedded) {
+                if (fname.empty()) {
+                    LLAMA_LOG_WARN("%s: model embeds an adapter but was loaded from a file pointer; adapter not applied\n", __func__);
+                } else {
+                    model->internal_lora = llama_adapter_lora_init_embedded(model, fname.c_str());
+                    if (model->internal_lora == nullptr) {
+                        throw std::runtime_error("failed to load embedded adapter from " + fname);
+                    }
+                }
+            }
+        }
+
         return {0, model_ptr.release()};
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading model: %s\n", __func__, err.what());

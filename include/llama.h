@@ -687,6 +687,16 @@ extern "C" {
             struct llama_model * model,
             const char * path_lora);
 
+    // Load an adapter embedded in a model file (single-file release):
+    // - the file must be a model (general.type == "model") that also carries the
+    //   adapter's .lora_a/.lora_b tensors, as produced by merging an adapter into the body
+    // - non-adapter tensors in the file are ignored
+    // - the adapter is applied automatically by every context created from the model
+    // The adapter is valid as long as the associated model is not freed
+    LLAMA_API struct llama_adapter_lora * llama_adapter_lora_init_embedded(
+            struct llama_model * model,
+            const char * path_lora);
+
     // Functions to access the adapter's GGUF metadata scalar values
     // - The functions return the length of the string on success, or -1 on failure
     // - The output string is always null-terminated and cleared on failure

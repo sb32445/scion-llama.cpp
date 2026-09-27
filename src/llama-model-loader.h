@@ -73,6 +73,10 @@ struct llama_model_loader {
     int n_tensors = 0;
     int n_created = 0;
 
+    // embedded-adapter tensors (.lora_a/.lora_b) in the model file; loaded by the
+    // adapter loader, not by the model (single-file releases)
+    int n_tensors_adapters = 0;
+
     uint64_t n_elements = 0;
     size_t   n_bytes    = 0;
 

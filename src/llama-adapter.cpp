@@ -176,7 +176,7 @@ static const ggml_tensor * taardis_virtual_anchor(const llama_model & model, con
     return nullptr;
 }
 
-static void llama_adapter_lora_init_impl(llama_model & model, const char * path_lora, llama_adapter_lora & adapter) {
+static void llama_adapter_lora_init_impl(llama_model & model, const char * path_lora, llama_adapter_lora & adapter, bool embedded = false) {
     LLAMA_LOG_INFO("%s: loading lora adapter from '%s' ...\n", __func__, path_lora);
 
     ggml_context * ctx_init;
@@ -230,7 +230,12 @@ static void llama_adapter_lora_init_impl(llama_model & model, const char * path_
         LLM_KV llm_kv = LLM_KV(LLM_ARCH_UNKNOWN);
 
         auto general_type = get_kv_str(llm_kv(LLM_KV_GENERAL_TYPE));
-        if (general_type != "adapter") {
+        if (embedded) {
+            // single-file release: the adapter tensors live inside the model file
+            if (general_type != "model") {
+                throw std::runtime_error("expect general.type to be 'model' for an embedded adapter, but got: " + general_type);
+            }
+        } else if (general_type != "adapter") {
             throw std::runtime_error("expect general.type to be 'adapter', but got: " + general_type);
         }
 
@@ -330,6 +335,9 @@ static void llama_adapter_lora_init_impl(llama_model & model, const char * path_
         } else if (str_endswith(name, "_norm.weight")) {
             // TODO: add support for norm vector
             // for now, we don't really care because most adapters still work fine without it
+            continue;
+        } else if (embedded) {
+            // embedded adapter: the file also contains the model's own tensors; ignore them
             continue;
         } else {
             throw std::runtime_error("LoRA tensor '" + name + "' has unexpected suffix");
@@ -489,6 +497,21 @@ llama_adapter_lora * llama_adapter_lora_init(llama_model * model, const char * p
         return adapter;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: failed to apply lora adapter: %s\n", __func__, err.what());
+
+        delete adapter;
+    }
+
+    return nullptr;
+}
+
+llama_adapter_lora * llama_adapter_lora_init_embedded(llama_model * model, const char * path_lora) {
+    llama_adapter_lora * adapter = new llama_adapter_lora(model);
+
+    try {
+        llama_adapter_lora_init_impl(*model, path_lora, *adapter, /*embedded*/ true);
+        return adapter;
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: failed to apply embedded lora adapter: %s\n", __func__, err.what());
 
         delete adapter;
     }
