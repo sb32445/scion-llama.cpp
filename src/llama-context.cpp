@@ -14,6 +14,7 @@
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
+#include "llama-mtp-sidecar.h"
 #include "llama-sampler.h"
 #include "llama.h"
 
@@ -1606,6 +1607,41 @@ void llama_context::set_warmup(bool value) {
 
     // warmups are usually with small batches, so no need to reserve
     //sched_need_reserve = true;
+}
+
+bool llama_context::mtp_sidecar_load(const char * path) {
+    if (!mtp_sidecar) {
+        mtp_sidecar.reset(new llama_mtp_sidecar(model));
+    }
+    std::vector<ggml_backend_t> backs;
+    backs.reserve(backends.size());
+    for (auto & b : backends) {
+        backs.push_back(b.get());
+    }
+    std::string err;
+    if (!mtp_sidecar->load(path, backs, err)) {
+        LLAMA_LOG_ERROR("%s: failed to load sidecar '%s': %s\n", __func__, path, err.c_str());
+        mtp_sidecar.reset();
+        return false;
+    }
+    return true;
+}
+
+bool llama_context::mtp_sidecar_draft(const float * h, int32_t token, llama_token * token_out) {
+    if (!mtp_sidecar) {
+        LLAMA_LOG_ERROR("%s: sidecar not loaded\n", __func__);
+        return false;
+    }
+    std::string err;
+    int32_t out = -1;
+    if (!mtp_sidecar->draft(h, token, out, err)) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, err.c_str());
+        return false;
+    }
+    if (token_out) {
+        *token_out = (llama_token) out;
+    }
+    return true;
 }
 
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
@@ -4337,6 +4373,14 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
 
 void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
     ctx->set_embeddings_nextn(value, masked);
+}
+
+bool llama_mtp_sidecar_load(llama_context * ctx, const char * path) {
+    return ctx->mtp_sidecar_load(path);
+}
+
+bool llama_mtp_sidecar_draft(llama_context * ctx, const float * h, int32_t token, llama_token * token_out) {
+    return ctx->mtp_sidecar_draft(h, token, token_out);
 }
 
 void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool value) {

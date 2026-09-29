@@ -121,6 +121,14 @@ LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int
 // Set whether the context outputs the input embeddings of a specific layer
 LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
 
+// Scion MTP sidecar drafter (frozen-body head; see llama-mtp-sidecar.h).
+// Load a sidecar GGUF ("scion-mtp-head") against this context's model; the
+// head reuses the model's output_norm/output/tok_embd tensors.
+// h is the post-norm hidden (llama_get_embeddings_nextn_ith on the target),
+// token is the token about to be decoded; returns the drafted token.
+LLAMA_API bool llama_mtp_sidecar_load(struct llama_context * ctx, const char * path);
+LLAMA_API bool llama_mtp_sidecar_draft(struct llama_context * ctx, const float * h, int32_t token, llama_token * token_out);
+
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);

@@ -15,6 +15,7 @@
 #include <vector>
 
 struct llama_model;
+struct llama_mtp_sidecar;
 class llama_batch_allocr;
 
 class llama_io_read_i;
@@ -276,6 +277,11 @@ public:
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
+    // Scion MTP sidecar (release drafter lane): load the sidecar GGUF and run
+    // one draft step against the target's own tensors. See llama-mtp-sidecar.h.
+    bool mtp_sidecar_load(const char * path);
+    bool mtp_sidecar_draft(const float * h, int32_t token, llama_token * token_out);
+
 private:
     llm_graph_params graph_params(
                         llm_graph_result * res,
@@ -379,6 +385,9 @@ private:
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
+
+    // Scion MTP sidecar drafter (frozen-body head; see llama-mtp-sidecar.h)
+    std::unique_ptr<llama_mtp_sidecar> mtp_sidecar;
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;

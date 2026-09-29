@@ -134,7 +134,8 @@ int main(int argc, char ** argv) {
     const int win_last  = atoi(argv[5]);
     const int seq       = argc > 6 ? atoi(argv[6]) : 512;
     const bool use_cpu  = argc > 7 && strcmp(argv[7], "cpu") == 0;
-    const bool mode_gen = argc > 8 && strcmp(argv[8], "gen") == 0;
+    const bool mode_gen = argc > 8 && (strcmp(argv[8], "gen") == 0 || strcmp(argv[8], "gen-api") == 0);
+    const bool gen_api  = argc > 8 && strcmp(argv[8], "gen-api") == 0;
 
     if (win_last <= win_first || seq < 4) {
         fail("bad window range or seq");
@@ -280,6 +281,9 @@ int main(int argc, char ** argv) {
         llama_context * lctx = llama_init_from_model(lmodel, cparams);
         if (!lctx) { fail("failed to create model context for gen mode"); }
         llama_set_embeddings_nextn(lctx, true, /*masked*/ false);
+        if (gen_api && !llama_mtp_sidecar_load(lctx, sidecar_path.c_str())) {
+            fail("llama_mtp_sidecar_load failed");
+        }
 
         std::vector<int32_t> gids(seq);
         std::vector<float> h_prev(H), h_cur(H);
@@ -336,16 +340,24 @@ int main(int argc, char ** argv) {
 
             for (int it = 0; it < n_steps && cur != llama_vocab_eos(voc); ++it) {
                 // draft: head(h at row pos-1, embedding of the token to decode)
-                ggml_backend_tensor_set(g_one.h, h_prev.data(), 0, (size_t) H * sizeof(float));
-                id_in = (int32_t) cur;
-                ggml_backend_tensor_set(g_one.ids, &id_in, 0, sizeof(int32_t));
                 const auto d0 = now();
-                if (ggml_backend_graph_compute(backend, g_one.gf) != GGML_STATUS_SUCCESS) {
-                    fail("draft graph compute failed");
-                }
-                ggml_backend_synchronize(backend);
                 int32_t draft = -1;
-                ggml_backend_tensor_get(g_one.am, &draft, 0, sizeof(int32_t));
+                if (gen_api) {
+                    llama_token t = -1;
+                    if (!llama_mtp_sidecar_draft(lctx, h_prev.data(), (int32_t) cur, &t)) {
+                        fail("llama_mtp_sidecar_draft failed");
+                    }
+                    draft = (int32_t) t;
+                } else {
+                    ggml_backend_tensor_set(g_one.h, h_prev.data(), 0, (size_t) H * sizeof(float));
+                    id_in = (int32_t) cur;
+                    ggml_backend_tensor_set(g_one.ids, &id_in, 0, sizeof(int32_t));
+                    if (ggml_backend_graph_compute(backend, g_one.gf) != GGML_STATUS_SUCCESS) {
+                        fail("draft graph compute failed");
+                    }
+                    ggml_backend_synchronize(backend);
+                    ggml_backend_tensor_get(g_one.am, &draft, 0, sizeof(int32_t));
+                }
                 draft_ms += ms_since(d0);
                 n_draft++;
 
