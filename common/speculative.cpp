@@ -3110,6 +3110,8 @@ struct common_speculative_impl_draft_mtp_sidecar : public common_speculative_imp
 
     int32_t n_embd = 0;
 
+    bool enabled = true;
+
     // [n_seq][n_embd] post-norm hidden at the most recent decoded row
     std::vector<std::vector<float>> last_h;
 
@@ -3127,6 +3129,17 @@ struct common_speculative_impl_draft_mtp_sidecar : public common_speculative_imp
         SPC_TRC("- path=%s, n_max=%d, n_embd=%d\n",
                 this->params.mparams.path.c_str(), this->params.n_max, n_embd);
 
+        if (this->params.n_max <= 0) {
+            // disabled via --spec-draft-n-max 0: do not load or engage nextn
+            SPC_WRN("%s", "draft-mtp-sidecar disabled (--spec-draft-n-max 0)\n");
+            enabled = false;
+            return;
+        }
+        if (this->params.mparams.path.empty()) {
+            throw std::runtime_error(
+                    "draft-mtp-sidecar needs the sidecar file: pass it with -md/--model-draft");
+        }
+
         if (!llama_mtp_sidecar_load(ctx_tgt, this->params.mparams.path.c_str())) {
             throw std::runtime_error("failed to load MTP sidecar '" + this->params.mparams.path + "'");
         }
@@ -3135,8 +3148,6 @@ struct common_speculative_impl_draft_mtp_sidecar : public common_speculative_imp
         llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
 
         last_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
-
-        this->params.n_max = std::min<int32_t>(std::max<int32_t>(this->params.n_max, 1), 1);
     }
 
     void begin(llama_seq_id /*seq_id*/, const llama_tokens & /*prompt*/) override {
@@ -3144,7 +3155,7 @@ struct common_speculative_impl_draft_mtp_sidecar : public common_speculative_imp
     }
 
     bool process(const llama_batch & batch) override {
-        if (batch.n_tokens <= 0 || batch.seq_id == nullptr) {
+        if (!enabled || batch.n_tokens <= 0 || batch.seq_id == nullptr) {
             return true;
         }
 
@@ -3175,6 +3186,9 @@ struct common_speculative_impl_draft_mtp_sidecar : public common_speculative_imp
     }
 
     void draft(common_speculative_draft_params_vec & dparams) override {
+        if (!enabled) {
+            return;
+        }
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) dparams.size(); ++seq_id) {
             auto & dp = dparams[seq_id];
             if (!dp.drafting) {
@@ -3815,8 +3829,11 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
             case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
             case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
             case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
-            case COMMON_SPECULATIVE_TYPE_DRAFT_MTP_SIDECAR:
                 n_max = std::max(n_max, std::max(0, spec->draft.n_max));
+                break;
+            case COMMON_SPECULATIVE_TYPE_DRAFT_MTP_SIDECAR:
+                // the sidecar head produces exactly one draft token per step
+                n_max = std::max(n_max, spec->draft.n_max > 0 ? 1 : 0);
                 break;
             case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:
                 n_max = std::max(n_max, (int32_t) spec->ngram_simple.size_m);
