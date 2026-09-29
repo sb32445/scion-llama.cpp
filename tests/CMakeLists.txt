@@ -398,3 +398,6 @@ endif()
 
 # mtp-probe: per-position post-norm hidden + greedy dump (Scion drafter lane)
 llama_build(test-mtp-probe.cpp)
+
+# mtp-sidecar: sidecar head acceptance + timing on dumped probe windows
+llama_build(test-mtp-sidecar.cpp)
