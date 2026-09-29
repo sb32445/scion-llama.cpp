@@ -1094,12 +1094,14 @@ private:
                 model_dft = spec_init->model();
                 ctx_dft   = spec_init->context();
 
-                if (has_draft && model_dft == nullptr) {
+                const bool needs_dft = common_speculative_needs_dft_context(params_base.speculative);
+
+                if (needs_dft && has_draft && model_dft == nullptr) {
                     SRV_ERR("failed to load draft model, '%s'\n", params_dft.model.path.c_str());
                     return false;
                 }
 
-                if (ctx_dft == nullptr) {
+                if (needs_dft && ctx_dft == nullptr) {
                     SRV_ERR("%s", "failed to create MTP context\n");
                     return false;
                 }

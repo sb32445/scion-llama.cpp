@@ -17,6 +17,11 @@ std::vector<enum common_speculative_type> common_speculative_types_from_names(co
 // infer the spec types from the GGUF metadata of a draft model; empty if unknown
 std::vector<enum common_speculative_type> common_speculative_types_from_gguf(const std::string & path);
 
+// true if any requested spec type requires a separate draft model/context
+// (draft-simple / eagle3 / mtp / dflash / dspark); false for ngram and
+// draft-mtp-sidecar, which run entirely against the target context
+bool common_speculative_needs_dft_context(const common_params_speculative & spec);
+
 // convert string to type
 enum common_speculative_type common_speculative_type_from_name(const std::string & name);
 
