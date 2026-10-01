@@ -33,12 +33,10 @@ jobs:
         with: { name: linux-x64-cpu, path: linux-x64-cpu.tar.gz }
 
   linux-vulkan:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - run: |
-          sudo add-apt-repository -y universe
-          sudo apt-get update && sudo apt-get install -y cmake g++ ninja-build libvulkan-dev glslc
+      - run: sudo apt-get update && sudo apt-get install -y cmake g++ ninja-build libvulkan-dev glslc
       - run: |
           cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF \
             -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_WEBUI=OFF -DGGML_VULKAN=ON
@@ -64,7 +62,7 @@ jobs:
 
   linux-hip:
     runs-on: ubuntu-22.04
-    container: rocm/dev-ubuntu-22.04:6.2
+    container: rocm/dev-ubuntu-22.04:6.4.1
     steps:
       - run: apt-get update && apt-get install -y cmake g++ git hipblas-dev rocblas-dev
       - uses: actions/checkout@v4
@@ -86,7 +84,8 @@ jobs:
       - run: |
           set +e; . /opt/intel/oneapi/setvars.sh; set -e
           cmake -B build -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF \
-            -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_WEBUI=OFF -DGGML_SYCL=ON
+            -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_WEBUI=OFF \
+            -DGGML_SYCL=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx
           cmake --build build -j 2 --target llama-cli llama-server
       - run: tar -czf linux-x64-sycl.tar.gz -C build/bin .
       - uses: actions/upload-artifact@v4
