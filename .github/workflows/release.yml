@@ -36,7 +36,9 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y cmake g++ ninja-build libvulkan-dev glslc
+      - run: |
+          sudo add-apt-repository -y universe
+          sudo apt-get update && sudo apt-get install -y cmake g++ ninja-build libvulkan-dev glslc
       - run: |
           cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF \
             -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_WEBUI=OFF -DGGML_VULKAN=ON
@@ -64,12 +66,12 @@ jobs:
     runs-on: ubuntu-22.04
     container: rocm/dev-ubuntu-22.04:6.2
     steps:
-      - run: apt-get update && apt-get install -y cmake g++ git
+      - run: apt-get update && apt-get install -y cmake g++ git hipblas-dev rocblas-dev
       - uses: actions/checkout@v4
       - run: |
           cmake -B build -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF \
             -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_WEBUI=OFF \
-            -DGGML_HIP=ON "-DAMDGPU_TARGETS=gfx1030;gfx1100;gfx1101;gfx1102;gfx1150"
+            -DCMAKE_PREFIX_PATH=/opt/rocm -DGGML_HIP=ON "-DAMDGPU_TARGETS=gfx1030;gfx1100;gfx1101;gfx1102;gfx1150"
           cmake --build build -j 2 --target llama-cli llama-server
       - run: tar -czf linux-x64-hip.tar.gz -C build/bin .
       - uses: actions/upload-artifact@v4
@@ -82,7 +84,7 @@ jobs:
       - run: apt-get update && apt-get install -y cmake g++ git
       - uses: actions/checkout@v4
       - run: |
-          . /opt/intel/oneapi/setvars.sh
+          set +e; . /opt/intel/oneapi/setvars.sh; set -e
           cmake -B build -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF \
             -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_WEBUI=OFF -DGGML_SYCL=ON
           cmake --build build -j 2 --target llama-cli llama-server
