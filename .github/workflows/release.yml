@@ -53,12 +53,16 @@ jobs:
     runs-on: ubuntu-22.04
     container: nvidia/cuda:12.4.1-devel-ubuntu22.04
     steps:
-      - run: apt-get update && apt-get install -y cmake g++ git
+      - run: |
+          apt-get update && apt-get install -y cmake g++ git
+          ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
       - uses: actions/checkout@v4
       - run: |
           cmake -B build -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF \
             -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_WEBUI=OFF \
-            -DGGML_CUDA=ON "-DCMAKE_CUDA_ARCHITECTURES=52;61;70;75;80;86;89"
+            -DGGML_CUDA=ON "-DCMAKE_CUDA_ARCHITECTURES=75;80;86;89" \
+            -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs"
           cmake --build build -j 2 --target llama-cli llama-server
       - run: tar -czf linux-x64-cuda.tar.gz -C build/bin .
       - uses: actions/upload-artifact@v4
