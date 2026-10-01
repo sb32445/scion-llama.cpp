@@ -1,11 +1,14 @@
 name: release
 
-# Builds fork binaries so users do NOT have to build (the fix for the
-# "unknown model architecture: 'mtp'" class of report). Draft: validate on a
-# workflow_dispatch run before relying on it.
+# Prebuilt fork binaries so users do NOT have to build — this is the durable
+# fix for the "unknown model architecture: 'mtp'" class of report. Draft:
+# validate with workflow_dispatch before tagging a release.
 #
-# Artifacts per backend are attached to the GitHub Release for a v* tag.
-# HIP/SYCL/CUDA use upstream container images (no GPU needed to compile).
+# Notes learned from the first dispatch:
+#  - GitHub Linux runners have ~7 GB RAM; `-j` (all cores) OOM-kills cc1plus.
+#    Always build with -j 2 and a reduced target surface.
+#  - container jobs need cmake/g++/git installed first.
+#  - CUDA/HIP arch lists contain ';' — quote them.
 
 on:
   workflow_dispatch:
@@ -16,67 +19,103 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    name: ${{ matrix.name }}
-    runs-on: ${{ matrix.os }}
-    container: ${{ matrix.container }}
-    continue-on-error: true
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: linux-x64-cpu
-            os: ubuntu-22.04
-            cmake: -DGGML_NATIVE=OFF
-          - name: linux-x64-vulkan
-            os: ubuntu-22.04
-            cmake: -DGGML_VULKAN=ON
-            apt: libvulkan-dev glslang-tools
-          - name: linux-x64-cuda
-            os: ubuntu-22.04
-            container: nvidia/cuda:12.4.1-devel-ubuntu22.04
-            cmake: -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=52;61;70;75;80;86;89
-          - name: linux-x64-hip
-            os: ubuntu-22.04
-            container: rocm/dev-ubuntu-22.04:6.2
-            cmake: -DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1030;gfx1100;gfx1101;gfx1102;gfx1150
-          - name: linux-x64-sycl
-            os: ubuntu-22.04
-            container: intel/oneapi-basekit:latest
-            cmake: -DGGML_SYCL=ON
-          - name: macos-arm64-metal
-            os: macos-14
-            cmake: -DGGML_METAL=ON
-          - name: windows-x64-cpu
-            os: windows-2022
-            cmake: -DGGML_NATIVE=OFF
+  linux-cpu:
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
-      - name: deps
-        if: matrix.apt != ''
-        run: |
-          apt-get update && apt-get install -y --no-install-recommends cmake g++ git ${{ matrix.apt }}
-      - name: configure + build
-        shell: bash
-        run: |
-          cmake -B build -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF ${{ matrix.cmake }}
-          cmake --build build -j --target llama-cli llama-server llama-bench
-      - name: package
-        shell: bash
-        run: |
-          mkdir -p dist
-          find build/bin -maxdepth 1 -type f \( -name 'llama-*' -o -name '*.so*' -o -name '*.dll' -o -name '*.dylib' \) \
-            -exec cp -a {} dist/ \; 2>/dev/null || true
-          tar -czf ${{ matrix.name }}.tar.gz -C dist .
+      - run: sudo apt-get update && sudo apt-get install -y cmake g++ ninja-build
+      - run: |
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF \
+            -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_WEBUI=OFF -DGGML_NATIVE=OFF
+          cmake --build build -j 2 --target llama-cli llama-server
+      - run: tar -czf linux-x64-cpu.tar.gz -C build/bin .
       - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.name }}
-          path: ${{ matrix.name }}.tar.gz
-          if-no-files-found: warn
+        with: { name: linux-x64-cpu, path: linux-x64-cpu.tar.gz }
+
+  linux-vulkan:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y cmake g++ ninja-build libvulkan-dev glslc
+      - run: |
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF \
+            -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_WEBUI=OFF -DGGML_VULKAN=ON
+          cmake --build build -j 2 --target llama-cli llama-server
+      - run: tar -czf linux-x64-vulkan.tar.gz -C build/bin .
+      - uses: actions/upload-artifact@v4
+        with: { name: linux-x64-vulkan, path: linux-x64-vulkan.tar.gz }
+
+  linux-cuda:
+    runs-on: ubuntu-22.04
+    container: nvidia/cuda:12.4.1-devel-ubuntu22.04
+    steps:
+      - run: apt-get update && apt-get install -y cmake g++ git
+      - uses: actions/checkout@v4
+      - run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF \
+            -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_WEBUI=OFF \
+            -DGGML_CUDA=ON "-DCMAKE_CUDA_ARCHITECTURES=52;61;70;75;80;86;89"
+          cmake --build build -j 2 --target llama-cli llama-server
+      - run: tar -czf linux-x64-cuda.tar.gz -C build/bin .
+      - uses: actions/upload-artifact@v4
+        with: { name: linux-x64-cuda, path: linux-x64-cuda.tar.gz }
+
+  linux-hip:
+    runs-on: ubuntu-22.04
+    container: rocm/dev-ubuntu-22.04:6.2
+    steps:
+      - run: apt-get update && apt-get install -y cmake g++ git
+      - uses: actions/checkout@v4
+      - run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF \
+            -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_WEBUI=OFF \
+            -DGGML_HIP=ON "-DAMDGPU_TARGETS=gfx1030;gfx1100;gfx1101;gfx1102;gfx1150"
+          cmake --build build -j 2 --target llama-cli llama-server
+      - run: tar -czf linux-x64-hip.tar.gz -C build/bin .
+      - uses: actions/upload-artifact@v4
+        with: { name: linux-x64-hip, path: linux-x64-hip.tar.gz }
+
+  linux-sycl:
+    runs-on: ubuntu-22.04
+    container: intel/oneapi-basekit:latest
+    steps:
+      - run: apt-get update && apt-get install -y cmake g++ git
+      - uses: actions/checkout@v4
+      - run: |
+          . /opt/intel/oneapi/setvars.sh
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF \
+            -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_WEBUI=OFF -DGGML_SYCL=ON
+          cmake --build build -j 2 --target llama-cli llama-server
+      - run: tar -czf linux-x64-sycl.tar.gz -C build/bin .
+      - uses: actions/upload-artifact@v4
+        with: { name: linux-x64-sycl, path: linux-x64-sycl.tar.gz }
+
+  macos-arm64-metal:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF \
+            -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_WEBUI=OFF -DGGML_METAL=ON
+          cmake --build build -j 2 --target llama-cli llama-server
+      - run: tar -czf macos-arm64-metal.tar.gz -C build/bin .
+      - uses: actions/upload-artifact@v4
+        with: { name: macos-arm64-metal, path: macos-arm64-metal.tar.gz }
+
+  windows-x64-cpu:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_WEBUI=OFF -DGGML_NATIVE=OFF
+      - run: cmake --build build --config Release -j 2 --target llama-cli llama-server
+      - run: Compress-Archive -Path build/bin/Release/* -DestinationPath windows-x64-cpu.zip
+        shell: pwsh
+      - uses: actions/upload-artifact@v4
+        with: { name: windows-x64-cpu, path: windows-x64-cpu.zip }
 
   release:
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux-cpu, linux-vulkan, linux-cuda, linux-hip, linux-sycl, macos-arm64-metal, windows-x64-cpu]
+    if: ${{ always() && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/download-artifact@v4
@@ -85,10 +124,10 @@ jobs:
           merge-multiple: true
       - uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/*.tar.gz
+          files: artifacts/*
           fail_on_unmatched_files: false
           body: |
             Fork binaries for `moe-corr-runtime` (Prism PQ2_0 container +
             embedded adapters + the `draft-mtp-sidecar` drafter).
-            These load `Scion-35B-A3B` and its k=1 MTP drafter without a build.
+            Load `Scion-35B-A3B` and its k=1 MTP drafter without a build.
             See the drafter card for usage.
