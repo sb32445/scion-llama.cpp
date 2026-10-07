@@ -569,6 +569,10 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
         }
     }
 
+    // a Scion MTP sidecar can only run through draft-mtp-sidecar; fix the type here for
+    // local files, and again at load time for paths that a download resolves later
+    common_speculative_apply_sidecar_type(params);
+
     // when a sidecar type is requested, the draft repo resolves to its sidecar instead of a full model
     const bool spec_sidecar_found = !plan_spec.mtp.local_path.empty() ||
                                     !plan_spec.dflash.local_path.empty() ||

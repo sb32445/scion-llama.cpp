@@ -359,6 +359,10 @@ llama_model * llama_model_create(llm_arch arch, const llama_model_params & param
 llama_model * llama_model_create(llama_model_loader & ml, const llama_model_params & params) {
     llm_arch arch = ml.get_arch();
     if (arch == LLM_ARCH_UNKNOWN) {
+        if (ml.get_arch_name() == "mtp") {
+            throw std::runtime_error(
+                "unknown model architecture: 'mtp' (this is an MTP sidecar head, not a model; load it with -md/--model-draft and no draft-model --spec-type)");
+        }
         throw std::runtime_error("unknown model architecture: '" + ml.get_arch_name() + "'");
     }
 

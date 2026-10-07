@@ -48,6 +48,20 @@ upstream `master`. Check what you have:
 grep -n "GGML_TYPE_PQ2_0" ggml/include/ggml.h   # expect: GGML_TYPE_PQ2_0 = 142
 ```
 
+## If you see "unknown model architecture: 'mtp'"
+
+```
+llama_model_load: error loading model: unknown model architecture: 'mtp'
+common_speculative_init_result: failed to load draft model, '...mtp-drafter.gguf'
+```
+
+The drafter is a target-context sidecar head, not a model, so it only loads
+through the `draft-mtp-sidecar` path. The log above means the run selected a
+draft-model type, most often `--spec-type draft-mtp`, which is the MTP head
+inside a full model and a different feature. Run `-md Scion-35B-A3B-mtp-drafter.gguf`
+with no `--spec-type`; the sidecar is detected from the GGUF. Current builds
+replace an explicit draft-model type with `draft-mtp-sidecar` and print a warning.
+
 ## What this branch adds on top of Prism's llama.cpp
 
 Roughly 90 lines, all in the runtime:

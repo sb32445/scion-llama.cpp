@@ -3770,6 +3770,50 @@ common_speculative_type common_speculative_type_from_name(const std::string & na
     return it->second;
 }
 
+static bool gguf_is_mtp_sidecar(gguf_context * ctx, const std::string & arch) {
+    // Scion MTP sidecar head (moe/mtp_sidecar_export.py)
+    return arch == "mtp" && gguf_find_tensor(ctx, "mtp.fc1.weight") >= 0;
+}
+
+bool common_speculative_is_mtp_sidecar(const std::string & path) {
+    struct gguf_init_params gguf_params = {
+        /* .no_alloc = */ true,
+        /* .ctx      = */ nullptr,
+    };
+
+    gguf_context_ptr gguf_ctx(gguf_init_from_file(path.c_str(), gguf_params));
+    if (!gguf_ctx) {
+        return false;
+    }
+
+    const int64_t arch_id = gguf_find_key(gguf_ctx.get(), "general.architecture");
+    if (arch_id < 0 || gguf_get_kv_type(gguf_ctx.get(), arch_id) != GGUF_TYPE_STRING) {
+        return false;
+    }
+
+    return gguf_is_mtp_sidecar(gguf_ctx.get(), gguf_get_val_str(gguf_ctx.get(), arch_id));
+}
+
+void common_speculative_apply_sidecar_type(common_params & params) {
+    if (params.speculative.draft.mparams.path.empty()) {
+        return;
+    }
+
+    const auto & types = params.speculative.types;
+    if (std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP_SIDECAR) != types.end()) {
+        return;
+    }
+
+    if (!common_speculative_is_mtp_sidecar(params.speculative.draft.mparams.path)) {
+        return;
+    }
+
+    LOG_WRN("%s: '%s' is an MTP sidecar; replacing --spec-type '%s' with 'draft-mtp-sidecar'\n",
+        __func__, params.speculative.draft.mparams.path.c_str(),
+        common_speculative_type_name_str(types).c_str());
+    params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP_SIDECAR };
+}
+
 std::vector<common_speculative_type> common_speculative_types_from_gguf(const std::string & path) {
     struct gguf_init_params gguf_params = {
         /* .no_alloc = */ true,
@@ -3787,12 +3831,20 @@ std::vector<common_speculative_type> common_speculative_types_from_gguf(const st
     }
 
     const std::string arch = gguf_get_val_str(gguf_ctx.get(), arch_id);
-    if (arch == "mtp" && gguf_find_tensor(gguf_ctx.get(), "mtp.fc1.weight") >= 0) {
-        // Scion MTP sidecar head (moe/mtp_sidecar_export.py)
+    if (gguf_is_mtp_sidecar(gguf_ctx.get(), arch)) {
         return { COMMON_SPECULATIVE_TYPE_DRAFT_MTP_SIDECAR };
     }
     if (arch != "dflash") {
-        const uint32_t block_count = gguf_get_val_u32(gguf_ctx.get(), gguf_find_key(gguf_ctx.get(), (arch + ".block_count").c_str()));
+        // not every GGUF carries <arch>.block_count; a bare 'mtp' file would read -1 and assert
+        const int64_t block_count_id = gguf_find_key(gguf_ctx.get(), (arch + ".block_count").c_str());
+        if (block_count_id < 0 || gguf_get_kv_type(gguf_ctx.get(), block_count_id) != GGUF_TYPE_UINT32) {
+            return {};
+        }
+
+        const uint32_t block_count = gguf_get_val_u32(gguf_ctx.get(), block_count_id);
+        if (block_count == 0) {
+            return {};
+        }
 
         if (gguf_find_tensor(gguf_ctx.get(), ("blk." + std::to_string(block_count - 1) + ".nextn.eh_proj.weight").c_str()) >= 0) {
             return { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
@@ -3933,6 +3985,8 @@ common_speculative_init_result::common_speculative_init_result(
       llama_model * model_tgt,
     llama_context * ctx_tgt) :
     pimpl(new impl{}) {
+    common_speculative_apply_sidecar_type(params);
+
     const bool has_draft = params.speculative.has_dft();
     const bool spec_mtp = std::find(params.speculative.types.begin(),
                                     params.speculative.types.end(),

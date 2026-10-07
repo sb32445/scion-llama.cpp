@@ -17,6 +17,14 @@ std::vector<enum common_speculative_type> common_speculative_types_from_names(co
 // infer the spec types from the GGUF metadata of a draft model; empty if unknown
 std::vector<enum common_speculative_type> common_speculative_types_from_gguf(const std::string & path);
 
+// true if the GGUF is a Scion target-context MTP sidecar (arch 'mtp' + mtp.fc1.weight);
+// such a file only runs through draft-mtp-sidecar, never as a draft model
+bool common_speculative_is_mtp_sidecar(const std::string & path);
+
+// replace an explicit draft-model --spec-type with draft-mtp-sidecar when the
+// draft path is a Scion MTP sidecar, so the model loader is never asked to open it
+void common_speculative_apply_sidecar_type(common_params & params);
+
 // true if any requested spec type requires a separate draft model/context
 // (draft-simple / eagle3 / mtp / dflash / dspark); false for ngram and
 // draft-mtp-sidecar, which run entirely against the target context
