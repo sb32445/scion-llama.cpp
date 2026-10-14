@@ -33,11 +33,16 @@ All are environment variables. Defaults depend on the GPU: Xe2 is Arc B-series a
 | `SYCL_UR_USE_LEVEL_ZERO_V2` | `0` (set by the library) | Set `1` to use the newer Level Zero adapter. |
 | `LLAMA_GDN_REPLAY` | on when one sequence and all recurrent layers are on SYCL | Speculative decoding rolls the delta-net state back by replay instead of snapshots. Needs `-np 1` on llama-server. |
 | `LLAMA_MTP_KV_ONLY`, `LLAMA_SYNC_TRIM` | on with a SYCL device | MTP prompt pass for the draft head writes K/V only; fewer context synchronizations. |
-| `GGML_SYCL_OP_TIMING` | `0` | `1` prints per-op GPU times. |
+| `GGML_SYCL_OP_TIMING` | `0` | `1` prints per-op GPU times for MTP draft graphs (small graphs only; a plain run prints nothing). |
 
 ## Expected speed
 
-Arc B390 (Xe3, Windows 11, driver 32.0.101.8860), Ternary Bonsai 2 27B PTQ1_0, `llama-bench -fa 1 -ctk q4_0 -ctv q4_0`, tokens/s:
+Arc B390 (Xe3, Windows 11, driver 32.0.101.8860), Ternary Bonsai 2 27B PTQ1_0, tokens/s:
+
+```sh
+llama-bench -m Ternary-Bonsai-2-27B-PTQ1_0.gguf -fa 1 -ctk q4_0 -ctv q4_0                # pp512, tg128
+llama-bench -m Ternary-Bonsai-2-27B-PTQ1_0.gguf -fa 1 -ctk q4_0 -ctv q4_0 -p 0 -d 16384  # tg128 at 16K
+```
 
 | | pp512 | tg128 | tg128 at 16K |
 |---|---|---|---|
@@ -48,7 +53,7 @@ Use `GGML_SYCL_PTQ1_T2=all` for long prompts and the defaults for chat-length pr
 
 ## Check correctness
 
-Compare against the CPU backend with KL divergence on a short wikitext run:
+Compare against the CPU backend with KL divergence on a short wikitext run. The CPU reference pass takes about 40 minutes on a laptop CPU and writes a 2 GB `base.kld`:
 
 ```sh
 llama-perplexity -m Ternary-Bonsai-2-27B-PTQ1_0.gguf -f wiki.test.raw --chunks 16 -c 512 -b 256 -ub 256 \
@@ -57,8 +62,8 @@ llama-perplexity -m Ternary-Bonsai-2-27B-PTQ1_0.gguf -f wiki.test.raw --chunks 1
     -ngl 99 -fa on -ctk q4_0 -ctv q4_0 --kl-divergence-base base.kld --kl-divergence
 ```
 
-Use `-b 256 -ub 256`: larger batches exceed the XMX decode attention's 256-token cap, so it would not be tested. On the B390 the defaults give mean KLD about 1.6e-3 and the same top token 98% of the time against a reference with the same q4_0 KV cache; the KV cache quantization adds to that against the CPU reference.
+Use `-b 256 -ub 256`: larger batches exceed the XMX decode attention's 256-token cap, so it would not be tested. On the B390 these commands give mean KLD 2.3e-3, PPL ratio 1.003 and the same top token 98.0% of the time with the defaults. Most of that is the q4_0 KV cache: against a reference that also uses a q4_0 KV cache, mean KLD is about 1.6e-3.
 
-Op-level checks: `test-backend-ops -b SYCL0 -o MUL_MAT`, `-o FLASH_ATTN_EXT`, `-o GATED_DELTA_NET`.
+Op-level checks: `test-backend-ops -b SYCL0 -o MUL_MAT`, `-o GATED_DELTA_NET`, and `-o FLASH_ATTN_EXT -p hsk=256` (the model's head size; head size 192 currently aborts in `fattn-tile.cpp`, a separate issue).
 
 When reporting a problem, include the release tag or commit, GPU, OS, driver, the command and any switches set.
