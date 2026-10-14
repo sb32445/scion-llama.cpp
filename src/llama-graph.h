@@ -11,6 +11,7 @@
 #include <set>
 #include <functional>
 #include <map>
+#include <string>
 #include <unordered_map>
 
 struct ggml_cgraph;
@@ -345,6 +346,13 @@ public:
     // shared across recurrent layers
     ggml_tensor * s_write_rows = nullptr;
     int64_t       s_write_K    = 0;
+
+    // ARC-LAB GDN rollback by replay (llama_memory_recurrent::rpl), null when off:
+    ggml_tensor * s_rpl_rows  = nullptr; // I32 [n_rs]: plane-0 S row each state is read from (no rollback plane)
+    ggml_tensor * s_rpl_main  = nullptr; // view [n_seqs]
+    ggml_tensor * s_rpl_extra = nullptr; // view [n_rs - n_seqs]
+    ggml_tensor * s_rpl_ctrl  = nullptr; // I32 [2, n_seqs]: {records to re-apply, their bank}
+    ggml_tensor * s_rpl_wrow  = nullptr; // I64 [n_seqs]: bank the new records go to
 
     const llama_memory_recurrent_context * mctx;
 
@@ -863,6 +871,7 @@ struct llm_graph_params {
     int64_t                          dspark_ctx_width;
     const llama_hadamard_rotations * hadamard_rotations;
     const llama_hadamard_rotations * hadamard_inverses;
+    ggml_tensor *                    mtp_chain_embd; // ARC-LAB: device copy of the draft-vocab token_embd rows, or null
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -928,6 +937,11 @@ struct llm_graph_params {
         }
 
         if (n_outputs != other.n_outputs) {
+            return false;
+        }
+
+        // ARC-LAB: a chained MTP draft graph only for the same step count (its input checks the per-step KV lengths)
+        if (cparams.mtp_chain_n != other.cparams.mtp_chain_n) {
             return false;
         }
 
@@ -1012,6 +1026,10 @@ public:
     // return true if the graph was updated and can be reused
     bool can_reuse(const llm_graph_params & params);
 
+    // ARC-LAB: why can_reuse(params) refuses (diagnostics, LLAMA_MTP_DRAFT_TIMING): "new" (never built), "params"
+    // (allow_reuse), or the type name of the first input that refuses; "" if it would not refuse
+    std::string reuse_miss_reason(const llm_graph_params & params);
+
     llm_graph_input_i * add_input(llm_graph_input_ptr input);
 
     void add_fused_node(llm_graph_fused_node result);
@@ -1035,6 +1053,11 @@ public:
 
     std::vector<ggml_tensor *> t_sampled;
     std::vector<ggml_tensor *> t_dspark_greedy;
+
+    // ARC-LAB: chained MTP draft (cparams.mtp_chain_n): per step, the argmax row of the draft logits (I32 [1]); an
+    // index into the draft head's vocabulary when it has one, else a token id
+    std::vector<ggml_tensor *> t_mtp_chain;
+    ggml_tensor *              t_mtp_chain_ids = nullptr; // I32 [n_steps]: the same ids in one tensor (one readback), or null
     std::vector<ggml_tensor *> t_sampled_probs;
     std::vector<ggml_tensor *> t_sampled_logits;
     std::vector<ggml_tensor *> t_candidates;
@@ -1127,6 +1150,7 @@ struct llm_graph_context {
     int64_t                          dspark_ctx_width;
     const llama_hadamard_rotations * hadamard_rotations;
     const llama_hadamard_rotations * hadamard_inverses;
+    ggml_tensor *                    mtp_chain_embd;
 
     // Transforms shared by folded weights on the same activation. Key is (input, rotation);
     // both must match. Valid for one graph build only.

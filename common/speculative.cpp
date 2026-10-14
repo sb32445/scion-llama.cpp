@@ -6,6 +6,7 @@
 #include "ggml.h"
 #include "llama.h"
 
+#include <chrono>
 #include <cmath>
 #include <limits>
 #ifdef LLAMA_DSPARK_MARKOV_CUDA
@@ -31,6 +32,89 @@
 #include <cstring>
 #include <iomanip>
 #include <map>
+
+// ARC-LAB: lab knobs from GGML_SYCL_KNOBS_FILE (lines NAME=V, re-read when the file changes) so one server can A/B
+// speculative settings: LAB_SPEC_DRAFT_N_MAX caps the MTP draft below --spec-draft-n-max, LAB_SPEC_NGRAM_START replaces
+// LLAMA_ARG_SPEC_NGRAM_ADAPT's starting length (both from the next request on). Unset = command line / env.
+#include <filesystem>
+#include <mutex>
+#include <unordered_map>
+// ARC-LAB: LLAMA_MTP_DRAFT_LOG=<file> appends one JSON line per MTP draft step (position predicted, depth, top 3 candidates
+// with probabilities, whether p_min stopped the draft) plus a "begin" line per request, for offline acceptance / tree
+// simulation (arctune, 2026-10-05).
+// ARC-LAB: LLAMA_MTP_DRAFT_TIMING=1: host-side phase timing of the MTP draft() calls (chain and loop), averaged and
+// printed to stderr every 64 calls. pre = deferred flushes before the draft, batch = building batches, decode = the
+// llama_decode calls (batch split, slot search, input uploads, kernel submission; no wait), wait = waiting for the GPU
+// and reading the draft back (chain: llama_get_mtp_chain_ids; loop: the per-step sampling, which syncs).
+struct common_mtp_draft_timing {
+    using clk = std::chrono::steady_clock;
+    const bool on = [] { const char * e = std::getenv("LLAMA_MTP_DRAFT_TIMING"); return e && std::atoi(e) != 0; }();
+    clk::time_point t0, t;
+    int    calls = 0, chain_calls = 0, decodes = 0;
+    double total = 0, pre = 0, batch = 0, decode = 0, wait = 0, rest = 0;
+    void begin() { if (on) { t0 = t = clk::now(); } }
+    void lap(double & acc) {
+        if (!on) { return; }
+        const auto n = clk::now();
+        acc += std::chrono::duration<double, std::milli>(n - t).count();
+        t = n;
+    }
+    void end(bool chain) {
+        if (!on) { return; }
+        lap(rest);
+        total += std::chrono::duration<double, std::milli>(t - t0).count();
+        calls++;
+        chain_calls += chain;
+        if (calls == 64) {
+            fprintf(stderr, "mtp-draft-timing: %d calls (%d chained), per call: total %.3f ms = pre %.3f + batch %.3f + "
+                    "decode %.3f (%.2f llama_decode) + wait/readback %.3f + rest %.3f\n", calls, chain_calls, total / calls,
+                    pre / calls, batch / calls, decode / calls, (double) decodes / calls, wait / calls, rest / calls);
+            calls = chain_calls = decodes = 0;
+            total = pre = batch = decode = wait = rest = 0;
+        }
+    }
+};
+static common_mtp_draft_timing g_mtp_dt;
+
+static FILE * common_mtp_draft_log() {
+    static FILE * f = [] {
+        const char * p = std::getenv("LLAMA_MTP_DRAFT_LOG");
+        return p ? fopen(p, "a") : nullptr;
+    }();
+    return f;
+}
+static int common_lab_knob(const char * name, int def) {
+    static const char * path = std::getenv("GGML_SYCL_KNOBS_FILE");
+    if (!path) {
+        return def;
+    }
+    static std::mutex                           mtx;
+    static std::filesystem::file_time_type      last{};
+    static std::unordered_map<std::string, int> m;
+    std::lock_guard<std::mutex> lock(mtx);
+    std::error_code ec;
+    const auto      t = std::filesystem::last_write_time(path, ec);
+    if (!ec && t != last) {
+        last = t;
+        m.clear();
+        if (FILE * fp = fopen(path, "r")) {
+            char line[256];
+            while (fgets(line, sizeof(line), fp)) {
+                char * eq = strchr(line, '=');
+                if (!eq || line[0] == '#') {
+                    continue;
+                }
+                *eq = 0;
+                std::string k(line);
+                k.erase(k.find_last_not_of(" \t") + 1);
+                m[k] = atoi(eq + 1);
+            }
+            fclose(fp);
+        }
+    }
+    const auto it = m.find(name);
+    return it == m.end() ? def : it->second;
+}
 
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_TRC(fmt, ...) LOG_TRC("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -2252,6 +2336,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     };
     std::vector<deferred_rows> deferred;
 
+    // ARC-LAB: chained drafts (LLAMA_MTP_CHAIN; independent implementation of the technique described by llamADALL).
+    // All draft steps run in one llama_decode (llama_set_mtp_chain): each step's argmax token and output row feed the
+    // next step on the device, and the n draft tokens are read back once, instead of n decodes with a host sample in
+    // between. Same greedy drafts and the same draft K/V as the loop below. Set in the ctor.
+    bool chain_mode = false;
+
     bool can_defer() const {
         return !is_mem_shared && !chain_heads && !getenv("LLAMA_MTP_EAGER_CATCHUP");
     }
@@ -2362,6 +2452,113 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         verify_h_rows.assign(n_seq, 0);
 
         deferred.assign(n_seq, {});
+
+        // chained drafts: default OFF for now (B580, 2026-10-10: identical drafts but -0.2..-0.8%, the chain graph is rebuilt
+        // on every draft; revisit with graph reuse). LLAMA_MTP_CHAIN=1 turns it on. Greedy single-sequence drafting only.
+        {
+            const char *  env  = getenv("LLAMA_MTP_CHAIN");
+            const int32_t sup  = llama_mtp_chain_support(ctx_dft);
+            const bool    want = env ? atoi(env) != 0 : false;
+            const char *  why  = nullptr;
+            if (!want) {
+                why = env ? "LLAMA_MTP_CHAIN=0" : "off by default (LLAMA_MTP_CHAIN=1 turns it on)";
+            } else if (sup == 0) {
+                why = "not supported by this context (qwen35 single head, flash attention, plain KV cache)";
+            } else if (is_mem_shared || chain_heads) {
+                why = "shared-memory or multi-head MTP";
+            } else if (n_seq != 1) {
+                why = "more than one sequence";
+            } else if (this->params.p_min > 0.0f) {
+                why = "p_min > 0";
+            }
+            chain_mode = why == nullptr;
+            if (chain_mode) {
+                SPC_INF("MTP chained drafts on (%s)\n", (sup & 2) ? "draft head" : "full head, host token lookups");
+            } else {
+                SPC_INF("MTP chained drafts off: %s\n", why);
+            }
+        }
+    }
+
+    // ARC-LAB: one chained decode for the whole draft of sequence 0. Returns false when it does not apply (the loop
+    // runs), true when it ran (dparams[0].result holds the drafts, empty on failure).
+    bool draft_chain(common_speculative_draft_params_vec & dparams) {
+        auto * ctx_dft = params.ctx_dft;
+        auto & dp      = dparams[0];
+        auto & d       = deferred[0];
+        if (!dp.drafting || d.catchup_failed) {
+            return false;
+        }
+
+        // the loop's step count: it stops once min(n_max, LAB_SPEC_DRAFT_N_MAX) tokens are drafted (at least one)
+        const int32_t n_draft = std::max(1, std::min((int) params.n_max, common_lab_knob("LAB_SPEC_DRAFT_N_MAX", params.n_max)));
+        const int32_t n_catch = d.pending ? d.n_valid : 0;
+        const int32_t n_rows  = n_catch + n_draft;
+        if (n_draft < 2 || n_rows > (int32_t) std::min(llama_n_batch(ctx_dft), llama_n_ubatch(ctx_dft))) {
+            return false;
+        }
+
+        const size_t row_bytes = (size_t) n_embd * sizeof(float);
+
+        g_mtp_dt.lap(g_mtp_dt.pre);
+        common_sampler_reset(smpls[0].get());
+        common_batch_clear(batch);
+
+        // catch-up rows and the anchor exactly as the loop's first decode, then one placeholder row per later step
+        // (its cell receives that step's K/V; token and embd are not read)
+        for (int32_t k = 0; k < n_catch; ++k) {
+            common_batch_add(batch, d.tokens[k], d.pos[k], { 0 }, false);
+            std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, d.h.data() + (size_t) k * n_embd, row_bytes);
+        }
+        common_batch_add(batch, dp.id_last, dp.n_past, { 0 }, true);
+        std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[0].data(), row_bytes);
+        for (int32_t j = 1; j < n_draft; ++j) {
+            common_batch_add(batch, dp.id_last, dp.n_past + j, { 0 }, false);
+            std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[0].data(), row_bytes);
+        }
+
+        g_mtp_dt.lap(g_mtp_dt.batch);
+        llama_set_mtp_chain(ctx_dft, n_draft);
+        const int32_t rc = llama_decode(ctx_dft, batch);
+        llama_set_mtp_chain(ctx_dft, 0);
+        g_mtp_dt.lap(g_mtp_dt.decode);
+        g_mtp_dt.decodes++;
+        if (rc != 0) {
+            SPC_ERR("llama_decode(ctx_dft) chained draft returned %d\n", (int) rc);
+            if (n_catch > 0) {
+                d.catchup_failed = true;
+            }
+            return true;
+        }
+        if (n_catch > 0) {
+            d.pending = false;
+        }
+
+        const llama_token * ids = llama_get_mtp_chain_ids(ctx_dft);
+        g_mtp_dt.lap(g_mtp_dt.wait);
+        if (ids == nullptr) {
+            SPC_ERR("%s", "chained draft produced no tokens\n");
+            return true;
+        }
+
+        auto *        smpl    = smpls[0].get();
+        auto &        result  = *dp.result;
+        const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)));
+        for (int32_t j = 0; j < n_draft; ++j) {
+            const llama_token id = ids[j];
+            if (FILE * lf = common_mtp_draft_log()) {
+                // the chain reads back token ids only: no candidate list or probabilities (p logged as -1)
+                fprintf(lf, "{\"pos\": %d, \"d\": %d, \"c\": [[%d, -1.0]], \"stop\": 0, \"chain\": 1}\n",
+                        (int) (dp.n_past + j + 1), j, (int) id);
+            }
+            if (id < 0 || id >= n_vocab) {
+                SPC_ERR("chained draft id %d out of vocab (step %d) - dropping the rest\n", (int) id, j);
+                break;
+            }
+            common_sampler_accept(smpl, id, true);
+            result.push_back(id);
+        }
+        return true;
     }
 
     ~common_speculative_impl_draft_mtp() override {
@@ -2385,6 +2582,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        if (FILE * lf = common_mtp_draft_log()) {
+            fprintf(lf, "{\"begin\": %zu, \"seq\": %d}\n", prompt.size(), (int) seq_id);
+            fflush(lf);
+        }
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
@@ -2607,9 +2808,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void draft(common_speculative_draft_params_vec & dparams) override {
+        g_mtp_dt.begin();
+        draft_impl(dparams);
+        g_mtp_dt.end(last_draft_chained);
+    }
+
+    bool last_draft_chained = false;
+
+    void draft_impl(common_speculative_draft_params_vec & dparams) {
         auto & ctx_dft = params.ctx_dft;
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
+        last_draft_chained = false;
 
         // deferred catch-up rows that do not lead straight into this draft position are decoded
         // on their own first (uses `batch`, so before it is built)
@@ -2663,6 +2873,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
+        if (chain_mode && draft_chain(dparams)) {
+            last_draft_chained = true;
+            auto & dp = dparams[0];
+            if (dp.result->size() < (size_t) params.n_min) {
+                dp.result->clear();
+            }
+            return;
+        }
+
+        g_mtp_dt.lap(g_mtp_dt.pre);
         common_batch_clear(batch);
 
         // keep track of which sequences are still drafting
@@ -2722,7 +2942,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_set_nextn_layer_offset(ctx_dft, i);
             }
 
+            g_mtp_dt.lap(g_mtp_dt.batch);
             int ret = llama_decode(ctx_dft, batch);
+            g_mtp_dt.lap(g_mtp_dt.decode);
+            g_mtp_dt.decodes++;
             if (ret != 0) {
                 SPC_ERR("llama_decode[%d] returned %d\n", i, ret);
                 if (i == 0) {
@@ -2755,6 +2978,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 auto * smpl = smpls[seq_id].get();
 
                 common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
+                g_mtp_dt.lap(g_mtp_dt.wait);
                 const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
@@ -2765,6 +2989,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                             common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
                 }
 
+                if (FILE * lf = common_mtp_draft_log()) {
+                    const auto & dpl = dparams.at(seq_id);
+                    fprintf(lf, "{\"pos\": %d, \"d\": %d, \"c\": [", (int) (dpl.n_past + i + 1), i);
+                    for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
+                        fprintf(lf, "%s[%d, %.4f]", k ? ", " : "", cur_p->data[k].id, cur_p->data[k].p);
+                    }
+                    fprintf(lf, "], \"stop\": %d}\n", cur_p->data[0].p < params.p_min ? 1 : 0);
+                }
                 // add drafted token for each sequence
                 const llama_token id = cur_p->data[0].id;
 
@@ -2791,7 +3023,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 result.push_back(id);
 
-                if (params.n_max <= (int) result.size()) {
+                if (std::min((int) params.n_max, common_lab_knob("LAB_SPEC_DRAFT_N_MAX", params.n_max)) <= (int) result.size()) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -2984,9 +3216,24 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
 
         // consecutive accept rounds with low acceptance fraction (< 0.5)
         int n_low = 0;
+
+        // ARC-LAB adaptive draft length: drafts are cut to n_cur tokens; n_cur doubles after a fully accepted draft
+        // (up to n_max) and halves after a rejected one (down to n_start). A copy ends where the model stops, but the
+        // context continues, so a fixed n_max of 256 threw away ~200 drafted tokens per short copy - at 48K context
+        // verifying those costs ~0.3 s each.
+        int n_cur = 0;
     };
 
     std::vector<seq_info> sinfos;
+
+    // LLAMA_ARG_SPEC_NGRAM_ADAPT=0 disables it (fixed n_max as upstream); other values = starting length (default 64).
+    // B580, n_max 256, t/s fixed vs 16 / 64 / 128: 48K short copy 38.6 / 60.7 / 57.3 / 45.7, 48K long copy 161.6 / 165 /
+    // 172.9 / 178.9, short rename 428 / 394 / 411 / 416, edit 305 / 296 / 299 / 316 (same outputs).
+    const int n_start_env = [] {
+        const char * e = std::getenv("LLAMA_ARG_SPEC_NGRAM_ADAPT");
+        return e ? std::atoi(e) : 64;
+    }();
+    int n_start = n_start_env;
 
     common_speculative_impl_ngram_mod(
             const common_params_speculative & params,
@@ -3016,6 +3263,8 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
 
         sinfo.i_last = 0;
         sinfo.n_draft_last = 0;
+        n_start = common_lab_knob("LAB_SPEC_NGRAM_START", n_start_env);
+        sinfo.n_cur = n_start > 0 ? std::min(n_start, params.n_max) : params.n_max;
 
         const size_t n = mod.get_n();
         if (prompt.size() < n) {
@@ -3091,6 +3340,11 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         }
         result.resize(result.size() - n);
 
+        // adaptive length: the n_min check above still sees the whole chain; only the returned draft is cut
+        if (sinfo.n_cur > 0 && result.size() > (size_t) sinfo.n_cur) {
+            result.resize(sinfo.n_cur);
+        }
+
         // store length of drafted n-gram for later acceptance analysis
         sinfo.n_draft_last = result.size();
     }
@@ -3119,6 +3373,11 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         }
 
         auto & sinfo = sinfos[seq_id];
+
+        if (n_start > 0 && sinfo.n_draft_last > 0) {
+            sinfo.n_cur = n_accepted >= sinfo.n_draft_last ? std::min(2 * sinfo.n_cur, (int) params.n_max)
+                                                            : std::max(std::min(n_start, (int) params.n_max), sinfo.n_cur / 2);
+        }
 
         // compute acceptance fraction if we have a recorded draft length
         if (sinfo.n_draft_last > 0) {

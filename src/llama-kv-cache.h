@@ -172,6 +172,11 @@ public:
 
     uint32_t get_n_kv(const slot_info & sinfo) const;
 
+    // ARC-LAB: get_n_kv as it would be if only the first n_rows of the applied ubatch held their cells (the KV length
+    // a decode of just those rows would attend over; chained MTP drafts size each step's view with it)
+    uint32_t get_n_kv_prefix(const slot_info & sinfo, uint32_t n_rows) const;
+    bool     get_v_trans() const { return v_trans; }
+
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
@@ -274,6 +279,12 @@ private:
 
     // pre-computed hadamard martrices
     std::unordered_map<int64_t, std::vector<float>> attn_rot_hadamard;
+
+    // ARC-LAB: device copies of attn_rot_hadamard (LLAMA_SYNC_TRIM bit 2): graphs read these instead of an input that
+    // is uploaded (one sync + one blocking copy each) on every decode
+    ggml_context_ptr                          attn_rot_dev_ctx;
+    ggml_backend_buffer_ptr                   attn_rot_dev_buf;
+    std::unordered_map<int64_t, ggml_tensor *> attn_rot_dev;
 
     // env: LLAMA_KV_CACHE_DEBUG
     int debug = 0;
@@ -391,6 +402,13 @@ public:
     //
 
     uint32_t get_n_kv() const;
+
+    // ARC-LAB: chained MTP drafts. KV length a decode of only the first n_rows of this ubatch would see, and views
+    // of the cache with an explicit length (the same views get_k / get_v return for that length)
+    uint32_t      get_n_kv_prefix(uint32_t n_rows) const;
+    ggml_tensor * get_k_n(ggml_context * ctx, int32_t il, uint32_t n_kv_view) const;
+    ggml_tensor * get_v_n(ggml_context * ctx, int32_t il, uint32_t n_kv_view) const;
+    bool          is_v_trans() const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;

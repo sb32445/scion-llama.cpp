@@ -36,6 +36,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <regex>
+#ifndef _WIN32
+#include <cxxabi.h>
+#include <dlfcn.h>
+#include <execinfo.h>
+#endif
 
 #include <sycl/sycl.hpp>
 #include <sycl/backend.hpp>
@@ -677,6 +682,98 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
+// ARC-LAB: GGML_SYCL_SYNC_TRACE=1: every ggml_backend_sycl_synchronize and blocking buffer_set_tensor is counted under its
+// cause: the scheduler's tag (ggml_sync_trace_set_cause: split input <name>, backend switch), else the first named caller
+// outside libggml (e.g. llama_get_logits_ith). Printed per 64 graphs of >= 2000 nodes (target graphs: ~ per MTP cycle).
+struct ggml_sycl_sync_trace {
+    const bool on = getenv("GGML_SYCL_SYNC_TRACE") && atoi(getenv("GGML_SYCL_SYNC_TRACE")) != 0;
+    std::mutex mtx;
+    int        n_big = 0, n_small = 0;
+    std::map<std::string, long>                         syncs;
+    std::map<std::string, std::pair<long, size_t>>     uploads;
+    std::unordered_map<void *, std::string>             names;  // return address -> caller label
+
+    std::string caller() {
+        const char * c = ggml_sync_trace_get_cause();
+        if (c) {
+            return c;
+        }
+#ifdef _WIN32
+        return std::string("?"); // no caller lookup on Windows
+#else
+        void * fr[24];
+        const int n = backtrace(fr, 24);
+        std::string label, last;
+        int named = 0;
+        for (int i = 1; i < n && named < 2; ++i) {
+            auto it = names.find(fr[i]);
+            std::string nm;
+            if (it != names.end()) {
+                nm = it->second;
+            } else {
+                Dl_info di{};
+                if (dladdr(fr[i], &di) && di.dli_sname && di.dli_fname && !strstr(di.dli_fname, "libggml")) {
+                    int st = 0;
+                    char * dm = abi::__cxa_demangle(di.dli_sname, nullptr, nullptr, &st);
+                    nm = dm && st == 0 ? std::string(dm) : std::string(di.dli_sname);
+                    free(dm);
+                    const size_t paren = nm.find('(');
+                    if (paren != std::string::npos) {
+                        nm.resize(paren);
+                    }
+                }
+                names[fr[i]] = nm;
+            }
+            if (!nm.empty() && nm != last) {
+                label += (label.empty() ? "" : " <- ") + nm;
+                last = nm;
+                named++;
+            }
+        }
+        return label.empty() ? std::string("?") : label;
+#endif
+    }
+    void note_sync() {
+        std::lock_guard<std::mutex> lock(mtx);
+        syncs[caller()]++;
+    }
+    void note_upload(size_t bytes) {
+        std::lock_guard<std::mutex> lock(mtx);
+        auto & u = uploads[caller()];
+        u.first++;
+        u.second += bytes;
+    }
+    void note_graph(const ggml_cgraph * g) {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (g->n_nodes < 2000) {
+            n_small++;
+            return;
+        }
+        if (++n_big < 64) {
+            return;
+        }
+        long ns = 0, nu = 0;
+        size_t nb = 0;
+        for (auto & kv : syncs) ns += kv.second;
+        for (auto & kv : uploads) { nu += kv.second.first; nb += kv.second.second; }
+        fprintf(stderr, "sync-trace: %d big graphs (+%d smaller), per big graph: %.1f synchronizes, %.1f blocking uploads (%.0f bytes)\n",
+                n_big, n_small, (double) ns / n_big, (double) nu / n_big, (double) nb / n_big);
+        std::vector<std::pair<long, std::string>> v;
+        for (auto & kv : syncs) v.push_back({ kv.second, kv.first });
+        std::sort(v.rbegin(), v.rend());
+        for (auto & e : v) fprintf(stderr, "sync-trace:   sync   %6.2f  %s\n", (double) e.first / n_big, e.second.c_str());
+        std::vector<std::pair<long, std::string>> w;
+        for (auto & kv : uploads) w.push_back({ kv.second.first, kv.first });
+        std::sort(w.rbegin(), w.rend());
+        for (auto & e : w) fprintf(stderr, "sync-trace:   upload %6.2f  %8.0f B  %s\n", (double) e.first / n_big,
+                                   (double) uploads[e.second].second / n_big, e.second.c_str());
+        n_big = n_small = 0;
+        syncs.clear();
+        uploads.clear();
+    }
+};
+static ggml_sycl_sync_trace g_sync_trace;
+
 // ARC-LAB: per-token accounting of synchronous buffer_set_tensor calls, printed with the GGML_SYCL_HOST_TIMING report
 static double g_st_ms = 0; static long g_st_calls = 0; static size_t g_st_bytes = 0;
 static void ggml_sycl_note_set_tensor(size_t bytes, double ms) { g_st_ms += ms; g_st_calls++; g_st_bytes += bytes; }
@@ -696,6 +793,9 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
         size_t bytes; std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
         ~st_timer() { ggml_sycl_note_set_tensor(bytes, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count()); }
     } st_guard{ size };
+    if (g_sync_trace.on) {
+        g_sync_trace.note_upload(size);
+    }
     // ARC-LAB: GGML_SYCL_FAST_SET_TENSOR=1: small writes (<= 4 MB, i.e. per-token inputs, not weights) skip the device-wide
     // wait and the malloc'd bounce buffer (the mmap workaround is for weights loaded from disk): one pinned staging copy and
     // one wait on this queue. Still synchronous for the caller.
@@ -6029,6 +6129,9 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
         case GGML_OP_GATED_DELTA_NET:
             ggml_sycl_gated_delta_net(ctx, dst);
             break;
+        case GGML_OP_GATED_DELTA_NET_REPLAY:
+            ggml_sycl_op_gated_delta_net_replay(ctx, dst, nullptr);
+            break;
         case GGML_OP_OPT_STEP_ADAMW:
             ggml_sycl_opt_step_adamw(ctx, dst);
             break;
@@ -6257,11 +6360,71 @@ struct sycl_host_timing {
 };
 static sycl_host_timing g_ht;
 
+// ARC-LAB: GGML_SYCL_OP_TIMING=1 -> GPU time per op type for draft-sized graphs (fewer than 2000 nodes, every mat-mul at
+// most 8 rows: the MTP draft decodes and chains, not the target's verify graph). The queue is drained after every kernel
+// group, so each entry is its kernel time plus one launch latency (a serialised upper bound); the sum is reported next to
+// the kernel-group count. Printed every 64 such graphs. Timing-only: it slows the draft, never use it for speed runs.
+struct sycl_op_timing {
+    bool on = getenv("GGML_SYCL_OP_TIMING") && atoi(getenv("GGML_SYCL_OP_TIMING"));
+    using clk = std::chrono::steady_clock;
+    int    graphs = 0;
+    long   groups = 0, nodes = 0;
+    double total = 0;
+    std::map<std::string, std::pair<double, long>> per_op;
+    static bool draft_sized(const ggml_cgraph * g) {
+        if (g->n_nodes >= 2000) return false;
+        bool mm = false;
+        for (int i = 0; i < g->n_nodes; ++i) {
+            const ggml_tensor * n = g->nodes[i];
+            // weight mat-muls only: a Hadamard transform reshapes each row into 1024-wide blocks (5..17 per row)
+            if (n->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(n, 1) != GGML_HINT_SRC0_IS_HADAMARD) {
+                mm = true;
+                if (n->src[1]->ne[1] * n->src[1]->ne[2] > 8) return false;
+            }
+        }
+        if (mm) {
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                fprintf(stderr, "op-timing: active (first draft-sized graph: %d nodes)\n", g->n_nodes);
+            }
+        }
+        return mm;
+    }
+    // op label: mat-muls by weight type (and the Hadamard transforms apart)
+    static std::string label(const ggml_tensor * n) {
+        if (n->op == GGML_OP_MUL_MAT) {
+            if (ggml_get_op_params_i32(n, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
+                return "MUL_MAT hadamard";
+            }
+            return std::string("MUL_MAT ") + ggml_type_name(n->src[0]->type);
+        }
+        return ggml_op_desc(n);
+    }
+    void report() {
+        fprintf(stderr, "op-timing: %d draft-sized graphs, per graph: %.3f ms serialised over %.1f kernel groups (%.0f nodes)\n",
+                graphs, total / graphs, (double) groups / graphs, (double) nodes / graphs);
+        std::vector<std::pair<double, std::string>> v;
+        for (auto & kv : per_op) v.push_back({ kv.second.first, kv.first });
+        std::sort(v.rbegin(), v.rend());
+        for (size_t i = 0; i < v.size() && i < 16; ++i) {
+            const auto & a = per_op[v[i].second];
+            fprintf(stderr, "op-timing:   %-22s %.3f ms/graph (%.1f groups/graph, %.1f us each)\n", v[i].second.c_str(),
+                    a.first / graphs, (double) a.second / graphs, 1000.0 * a.first / std::max(1L, a.second));
+        }
+        graphs = 0; groups = 0; nodes = 0; total = 0; per_op.clear();
+    }
+};
+static sycl_op_timing g_ot;
+
 static void ggml_backend_sycl_synchronize(ggml_backend_t backend) try {
     GGML_SYCL_DEBUG("[SYCL] call %s\n", __func__);
     ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *)backend->context;
     const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
     const auto      ht_t0  = sycl_host_timing::clk::now();
+    if (g_sync_trace.on) {
+        g_sync_trace.note_sync();
+    }
     SYCL_CHECK(CHECK_TRY_ERROR((stream)->wait()));
     g_upload_off = 0;
     if (g_ht.on) {
@@ -6364,6 +6527,83 @@ static int ggml_sycl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_i
     return skip;
 }
 
+// ARC-LAB: match GATED_DELTA_NET_REPLAY + the two nodes that store its output in the recurrent cache - a CPY of the
+// base state and a SET_ROWS of the update records into the bank picked by its row index - so the kernel writes both
+// straight into the cache and the two copies are skipped. Single sequence only. Returns the nodes to skip (0 = none).
+static int ggml_sycl_try_gdn_replay_fusion(const ggml_cgraph * cgraph, int node_idx, ggml_sycl_gdn_replay_fused & fused) {
+    if (!g_ggml_sycl_enable_fusion) {
+        return 0;
+    }
+    const ggml_tensor * gdn = cgraph->nodes[node_idx];
+    if (gdn->op != GGML_OP_GATED_DELTA_NET_REPLAY || gdn->type != GGML_TYPE_F32 || (gdn->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return 0;
+    }
+    const ggml_tensor * src_v    = gdn->src[2];
+    const int64_t       S_v      = src_v->ne[0];
+    const int64_t       H        = src_v->ne[1];
+    const int64_t       n_tokens = src_v->ne[2];
+    const int64_t       n_seqs   = src_v->ne[3];
+    const int64_t       K        = ggml_get_op_params_i32(gdn, 0);
+    const int64_t       D        = S_v * S_v * H;
+    const int64_t       R        = H * (2 * S_v + 1);
+    if (n_seqs != 1) {
+        return 0;
+    }
+    const size_t base_off = ggml_row_size(GGML_TYPE_F32, S_v * H * n_tokens * n_seqs);
+    const size_t rec_off  = base_off + ggml_row_size(GGML_TYPE_F32, D * n_seqs);
+
+    // the next two computed nodes must be the CPY and the SET_ROWS (either order), nothing in between
+    const ggml_tensor * cpy  = nullptr;
+    const ggml_tensor * sr   = nullptr;
+    int                 skip = 0;
+    for (int j = node_idx + 1; j < cgraph->n_nodes && (cpy == nullptr || sr == nullptr); ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (ggml_sycl_is_view_or_noop(n) || (n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+        if ((n->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            return 0;
+        }
+        if (n->op == GGML_OP_CPY && cpy == nullptr) {
+            cpy = n;
+        } else if (n->op == GGML_OP_SET_ROWS && sr == nullptr) {
+            sr = n;
+        } else {
+            return 0;
+        }
+        skip = j - node_idx;
+    }
+    if (cpy == nullptr || sr == nullptr) {
+        return 0;
+    }
+
+    // CPY: base region of this op's output -> a contiguous F32 cache view of D * n_seqs floats
+    const ggml_tensor * cs = cpy->src[0];
+    const ggml_tensor * cd = cpy->src[1];
+    if (cs->op != GGML_OP_VIEW || cs->view_src != gdn || cs->view_offs != base_off || !ggml_is_contiguous(cs) ||
+        ggml_nelements(cs) != D * n_seqs || cd->type != GGML_TYPE_F32 || cd->data == nullptr ||
+        !ggml_is_contiguous(cd)) {
+        return 0;
+    }
+
+    // SET_ROWS: one row of R * (K - 1) records from the record region -> F32 rows (banks), I64 index on the device
+    const ggml_tensor * rs = sr->src[0];
+    const ggml_tensor * ri = sr->src[1];
+    if (rs->op != GGML_OP_VIEW || rs->view_src != gdn || rs->view_offs != rec_off || !ggml_is_contiguous(rs) ||
+        rs->ne[0] != R * (K - 1) || ggml_nrows(rs) != 1 || sr->type != GGML_TYPE_F32 || sr->data == nullptr ||
+        sr->ne[0] != R * (K - 1) || sr->nb[0] != sizeof(float) || sr->nb[1] % sizeof(float) != 0 ||
+        ri->type != GGML_TYPE_I64 || ggml_nelements(ri) != 1 || ri->data == nullptr ||
+        (ri->buffer && ggml_backend_buffer_is_host(ri->buffer))) {
+        return 0;
+    }
+
+    fused.base           = (float *) cd->data;
+    fused.rec            = (float *) sr->data;
+    fused.rec_rows       = (const int64_t *) ri->data;
+    fused.rec_row_stride = (int64_t) (sr->nb[1] / sizeof(float));
+    return skip;
+}
+
 // GET_ROWS that gathers a recurrent state row feeding only GATED_DELTA_NET src[5] (possibly through a RESHAPE):
 // skip it and let the kernel read the cache row directly. Single sequence only. GGML_SYCL_GDN_GATHER=0 disables.
 static bool ggml_sycl_try_gdn_gather_skip(ggml_backend_sycl_context & ctx, const ggml_cgraph * cgraph, int node_idx) {
@@ -6390,7 +6630,7 @@ static bool ggml_sycl_try_gdn_gather_skip(ggml_backend_sycl_context & ctx, const
     const ggml_tensor * cur = gr;
     for (int j = node_idx + 1; j < cgraph->n_nodes; ++j) {
         const ggml_tensor * n = cgraph->nodes[j];
-        if (n->op == GGML_OP_GATED_DELTA_NET && n->src[5] == cur) {
+        if ((n->op == GGML_OP_GATED_DELTA_NET || n->op == GGML_OP_GATED_DELTA_NET_REPLAY) && n->src[5] == cur) {
             const ggml_tensor * v = n->src[2];
             const int64_t       D = v->ne[0] * v->ne[0] * v->ne[1];
             if (gr->ne[0] != D || v->ne[3] != 1 || ggml_nelements(cur) != D) {
@@ -7174,6 +7414,30 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     const bool                       ht_on   = g_ht.on && cgraph->n_nodes > 500;
     sycl_host_timing::clk::time_point ht_prev = sycl_host_timing::clk::now();
     const char *                     ht_op   = nullptr;
+    const bool                       ot_on   = g_ot.on && sycl_op_timing::draft_sized(cgraph);
+    sycl_op_timing::clk::time_point  ot_prev{};
+    std::string                      ot_op;
+    auto ot_mark = [&](const std::string & next) {  // drain the queue, charge the time since the last mark to the op that ran
+        SYCL_CHECK(CHECK_TRY_ERROR(sycl_ctx->stream()->wait()));
+        const auto now = sycl_op_timing::clk::now();
+        if (!ot_op.empty()) {
+            const double ms = std::chrono::duration<double, std::milli>(now - ot_prev).count();
+            auto & a = g_ot.per_op[ot_op];
+            a.first += ms;
+            a.second++;
+            g_ot.total += ms;
+            g_ot.groups++;
+        }
+        ot_prev = now;
+        ot_op   = next;
+    };
+    if (g_sync_trace.on) {
+        g_sync_trace.note_graph(cgraph);
+    }
+    if (ot_on) {
+        ot_mark(std::string());  // inputs and earlier work are not charged
+        g_ot.nodes += cgraph->n_nodes;
+    }
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
         if (ht_on) {
@@ -7197,6 +7461,9 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         }
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             continue;
+        }
+        if (ot_on) {
+            ot_mark(sycl_op_timing::label(node));
         }
 
         const int nodes_to_skip = ggml_sycl_fuse(*sycl_ctx, cgraph, i);
@@ -7222,6 +7489,15 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             if (gdn_nodes_to_skip > 0) {
                 ggml_sycl_op_gated_delta_net_fused_cache(*sycl_ctx, node, fused_state_cpy);
                 i += gdn_nodes_to_skip;
+                continue;
+            }
+        }
+        if (node->op == GGML_OP_GATED_DELTA_NET_REPLAY) {
+            ggml_sycl_gdn_replay_fused fused;
+            const int rpl_nodes_to_skip = ggml_sycl_try_gdn_replay_fusion(cgraph, i, fused);
+            if (rpl_nodes_to_skip > 0) {
+                ggml_sycl_op_gated_delta_net_replay(*sycl_ctx, node, &fused);
+                i += rpl_nodes_to_skip;
                 continue;
             }
         }
@@ -7327,6 +7603,12 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
         }
         GGML_ASSERT(ok);
+    }
+    if (ot_on) {
+        ot_mark(std::string());
+        if (++g_ot.graphs == 64) {
+            g_ot.report();
+        }
     }
 }
 
@@ -7748,11 +8030,11 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
             {
                 switch (op->src[0]->type) {
                     case GGML_TYPE_I32:
+                    case GGML_TYPE_PTQ1_0:  // ARC-LAB: dequantize_ptq1_0_f32, bit-exact with the CPU
                     case GGML_TYPE_F16:
                     case GGML_TYPE_BF16:
                     case GGML_TYPE_F32:
                     case GGML_TYPE_Q1_0:
-                    case GGML_TYPE_PTQ1_0:
                     case GGML_TYPE_PQ2_0:
                     case GGML_TYPE_MXFP4:
                     case GGML_TYPE_NVFP4:
@@ -8037,6 +8319,9 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
         case GGML_OP_GATED_DELTA_NET:
             // rows-indexed state read (src[6]) and raw gates (op_params[1]) not implemented here
             return op->src[6] == NULL && ggml_get_op_params_i32(op, 1) == 0;
+        case GGML_OP_GATED_DELTA_NET_REPLAY:
+            // ARC-LAB: kernels exist for the scalar gate at head size 128 (Bonsai / Qwen3.5) only
+            return op->src[2]->ne[0] == 128 && op->src[3]->ne[0] == 1 && ggml_are_same_stride(op->src[0], op->src[1]);
         case GGML_OP_SSM_CONV:
             return op->type == GGML_TYPE_F32 &&
                    op->src[0]->type == GGML_TYPE_F32 &&

@@ -22,6 +22,7 @@
 #include <numeric>
 #include <sstream>
 #include <string>
+#include <typeinfo>
 #include <unordered_set>
 
 // dedup helpers
@@ -385,6 +386,27 @@ void llm_graph_input_rs::set_input_rs(const llama_memory_recurrent_context * mct
         }
     }
 
+    if (s_rpl_ctrl) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(s_rpl_rows->buffer));
+        GGML_ASSERT(ggml_backend_buffer_is_host(s_rpl_ctrl->buffer));
+        GGML_ASSERT(ggml_backend_buffer_is_host(s_rpl_wrow->buffer));
+        int32_t * rows = (int32_t *) s_rpl_rows->data;
+        int32_t * ctrl = (int32_t *) s_rpl_ctrl->data;
+        int64_t * wrow = (int64_t *) s_rpl_wrow->data;
+
+        for (uint32_t i = 0; i < n_rs; ++i) {
+            rows[i] = mctx_cur->rpl_row(i);
+        }
+        for (uint32_t i = 0; i < ubatch->n_seqs; ++i) {
+            int32_t n_rec = 0;
+            int32_t bank  = 0;
+            mctx_cur->rpl_take(i, ubatch->n_seq_tokens, n_rec, bank);
+            ctrl[2*i + 0] = n_rec;
+            ctrl[2*i + 1] = bank;
+            wrow[i]       = bank ^ 1;
+        }
+    }
+
     if (s_write_rows) {
         GGML_ASSERT(ggml_backend_buffer_is_host(s_write_rows->buffer));
         int64_t * data = (int64_t *) s_write_rows->data;
@@ -416,6 +438,12 @@ bool llm_graph_input_rs::can_reuse_rs(const llama_memory_recurrent_context * mct
 
     res &= head == mctx_cur->get_head();
     res &= rs_z == mctx_cur->get_rs_z();
+
+    res &= (s_rpl_ctrl != nullptr) == mctx_cur->get_rpl();
+    if (s_rpl_ctrl) {
+        res &= s_rpl_rows->ne[0] == mctx_cur->get_n_rs();
+        res &= s_rpl_ctrl->ne[0] == 2 * params.ubatch.n_seqs;
+    }
 
     return res;
 }
@@ -541,7 +569,10 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
 
 void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_k_idxs(self_k_idxs, ubatch);
-    mctx->set_input_v_idxs(self_v_idxs, ubatch);
+    // ARC-LAB: left unallocated when the graph stores V with the K indices (MTP chain, non-transposed V)
+    if (self_v_idxs && self_v_idxs->buffer) {
+        mctx->set_input_v_idxs(self_v_idxs, ubatch);
+    }
 
     // the mask is left unallocated when the graph only stores K/V without attending
     // (e.g. DFlash's KV-injection pass)
@@ -1354,6 +1385,8 @@ void llm_graph_result::reset() {
 
     t_sampled.clear();
     t_dspark_greedy.clear();
+    t_mtp_chain.clear();
+    t_mtp_chain_ids = nullptr;
     t_sampled_probs.clear();
     t_sampled_logits.clear();
     t_candidates.clear();
@@ -1461,6 +1494,22 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
+std::string llm_graph_result::reuse_miss_reason(const llm_graph_params & params) {
+    if (inputs.empty()) {
+        return "new";
+    }
+    if (!this->params.allow_reuse(params)) {
+        return "params";
+    }
+    for (auto & input : inputs) {
+        if (!input->can_reuse(params)) {
+            const llm_graph_input_i & in = *input;
+            return typeid(in).name();
+        }
+    }
+    return "";
+}
+
 llm_graph_input_i * llm_graph_result::add_input(llm_graph_input_ptr input) {
     inputs.emplace_back(std::move(input));
     return inputs.back().get();
@@ -1521,6 +1570,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     dspark_ctx_width(params.dspark_ctx_width),
     hadamard_rotations(params.hadamard_rotations),
     hadamard_inverses(params.hadamard_inverses),
+    mtp_chain_embd(params.mtp_chain_embd),
     samplers(params.samplers),
     cb_func(params.cb),
     res(params.res),
@@ -3575,6 +3625,18 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
 
     inp->s_copy_main  = ggml_view_1d(ctx0, inp->s_copy, n_seqs, 0);
     inp->s_copy_extra = ggml_view_1d(ctx0, inp->s_copy, n_rs - n_seqs, n_seqs * inp->s_copy->nb[0]);
+
+    if (mctx_cur->get_rpl()) {
+        inp->s_rpl_rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rs);
+        ggml_set_input(inp->s_rpl_rows);
+        inp->s_rpl_main  = ggml_view_1d(ctx0, inp->s_rpl_rows, n_seqs, 0);
+        inp->s_rpl_extra = ggml_view_1d(ctx0, inp->s_rpl_rows, n_rs - n_seqs, n_seqs * inp->s_rpl_rows->nb[0]);
+
+        inp->s_rpl_ctrl = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 2 * n_seqs);
+        ggml_set_input(inp->s_rpl_ctrl);
+        inp->s_rpl_wrow = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_seqs);
+        ggml_set_input(inp->s_rpl_wrow);
+    }
 
     inp->head = mctx_cur->get_head();
     inp->rs_z = mctx_cur->get_rs_z();

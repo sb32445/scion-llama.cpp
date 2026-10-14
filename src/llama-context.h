@@ -134,6 +134,11 @@ struct llama_context {
 
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
+
+    // ARC-LAB: chained MTP drafts (llama-ext.h llama_mtp_chain_support / llama_set_mtp_chain / llama_get_mtp_chain_ids)
+    int32_t         mtp_chain_support() const;
+    void            set_mtp_chain(uint32_t n_steps);
+    const int32_t * get_mtp_chain_ids();
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
@@ -403,6 +408,38 @@ private:
     // one-time Hadamard transform-coverage check on the first built graph
     bool hadamard_verified = false;
 
+    // ARC-LAB: chained MTP drafts. mtp_chain_embd: device copy of the token_embd rows the draft head can produce (row k
+    // = token mtp_chain_vocab[k]), built on first use unless LLAMA_MTP_CHAIN_GPU_EMBD=0. mtp_chain_out: the last chain
+    // decode's per-step argmax rows, read back asynchronously.
+    ggml_tensor *           mtp_chain_embd = nullptr;
+    ggml_context_ptr        mtp_chain_ctx;
+    ggml_backend_buffer_ptr mtp_chain_buf;
+    bool                    mtp_chain_embd_tried = false;
+    std::vector<int32_t>    mtp_chain_vocab;   // draft-head index -> token id (empty: no draft head, indices are tokens)
+    std::vector<int32_t>    mtp_chain_out;
+    std::vector<int32_t>    mtp_chain_tok;     // mtp_chain_out mapped to token ids
+
+    // ARC-LAB: chain graphs are kept per batch shape, each with its own scheduler, so a draft whose shape (rows, steps)
+    // and per-step KV lengths match an earlier one reuses its built and allocated graph: no build, split or allocation
+    // per draft, and the regular decodes keep their own reusable graph in gf_res_prev
+    struct mtp_chain_entry {
+        ggml_backend_sched_ptr sched;
+        llm_graph_result_ptr   res;
+    };
+    std::map<uint32_t, mtp_chain_entry> mtp_chain_cache;
+    mtp_chain_entry * mtp_chain_entry_for(uint32_t n_tokens);
+    uint32_t                mtp_chain_n_out = 0;
+
+    // ARC-LAB: LLAMA_MTP_DRAFT_TIMING=1: per chain decode, whether its cached graph was reused (else why not) and the
+    // host time of process_ubatch's parts; printed to stderr every 64 chain decodes
+    struct mtp_chain_reuse_stats {
+        int                        n = 0, reused = 0;
+        double                     build_ms = 0, set_ms = 0, compute_ms = 0;
+        std::map<std::string, int> miss;
+        void report();
+    };
+    mtp_chain_reuse_stats mtp_chain_rs;
+
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
 
@@ -410,6 +447,7 @@ private:
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
 
     bool has_evaluated_once = false;
+    bool sync_pending       = true;  // ARC-LAB: work queued since the last synchronize (LLAMA_SYNC_TRIM)
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
