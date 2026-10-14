@@ -47,6 +47,26 @@ static __dpct_inline__ void dequantize_q2_0(const void *vx, const int64_t ib,
 #endif // GGML_SYCL_F16
 }
 
+// Trit of element e (0..127) in a PTQ1_0 block: 16 bytes x 5, 8 bytes x 5, then 2 qh bytes x 4.
+static __dpct_inline__ int ptq1_0_trit(const uint8_t * qs, const uint8_t * qh, const int e) {
+    uint32_t v;
+    int      t;
+    if (e < 80) {
+        v = qs[e % 16];
+        t = e / 16;
+    } else if (e < 120) {
+        v = qs[16 + (e - 80) % 8];
+        t = (e - 80) / 8;
+    } else {
+        v = qh[(e - 120) % 2];
+        t = (e - 120) / 2;
+    }
+    for (int i = 0; i < t; ++i) {
+        v = (v * 3) & 0xFF;
+    }
+    return (int) ((v * 3) >> 8);
+}
+
 static __dpct_inline__ void dequantize_q4_0(const void *vx, const int64_t ib,
                                             const int iqs, dfloat2 &v) {
     const block_q4_0 * x = (const block_q4_0 *) vx;

@@ -105,6 +105,15 @@ endif()
 
 target_compile_options(ggml-sycl PRIVATE "-Wno-narrowing")
 
+# ARC-LAB: one device image per kernel. The Xe2 XMX kernels (DPAS) then only get JIT-compiled when they are first launched,
+# so a GPU without DPAS (Xe-LP, Gen9) never compiles them; with one image per source file, compiling any kernel of
+# fattn-dec / mmvq / ptq1-t2 built the DPAS ones too and the shader compiler crashed (UHD 630). OFF = compiler default.
+option(GGML_SYCL_DEVICE_CODE_SPLIT_PER_KERNEL "ggml: SYCL device code split per kernel" ON)
+if (GGML_SYCL_DEVICE_CODE_SPLIT_PER_KERNEL)
+    target_compile_options(ggml-sycl PRIVATE "-fsycl-device-code-split=per_kernel")
+    target_link_options(ggml-sycl PRIVATE "-fsycl-device-code-split=per_kernel")
+endif()
+
 message(STATUS "GGML_SYCL_SUPPORT_LEVEL_ZERO_API ${GGML_SYCL_SUPPORT_LEVEL_ZERO_API}")
 if (GGML_SYCL_SUPPORT_LEVEL_ZERO_API)
     # Link against Level Zero loader for direct device memory allocation.
