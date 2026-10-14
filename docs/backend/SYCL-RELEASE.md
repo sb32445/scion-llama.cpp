@@ -27,4 +27,6 @@ The SYCL archive includes the oneAPI 2025.3.3 runtime DLLs used by the upstream 
 
 Check that the Intel GPU appears before running inference. Use a model supported by the fork's SYCL backend, and verify output correctness as well as speed. Report the model filename, release tag, GPU, OS, driver and command when reporting a problem.
 
+For the Ternary Bonsai 2 models (switches, expected speed, a KLD check), see [SYCL-bonsai.md](SYCL-bonsai.md).
+
 For installation and backend options, see https://github.com/PrismML-Eng/llama.cpp/blob/prism/docs/backend/SYCL.md.
