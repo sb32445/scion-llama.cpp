@@ -1431,7 +1431,35 @@ std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
     return pimpl->lora;
 }
 
+// true if the main model offloads to a CUDA device
+static bool common_params_offload_cuda(const common_params & params) {
+    if (params.n_gpu_layers == 0) {
+        return false;
+    }
+
+    // no --device list: the model goes to the first GPU
+    std::vector<ggml_backend_dev_t> devs = params.devices;
+    if (devs.empty()) {
+        devs.push_back(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU));
+    }
+
+    for (auto * dev : devs) {
+        if (dev != nullptr && strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "CUDA") == 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
+    auto & spec = params.speculative;
+    if (!spec.draft.n_max_set && common_params_offload_cuda(params) &&
+        std::find(spec.types.begin(), spec.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != spec.types.end()) {
+        spec.draft.n_max = COMMON_SPEC_MTP_N_MAX_CUDA;
+        COM_INF("using MTP draft depth %d on CUDA (set --spec-draft-n-max to override)\n", spec.draft.n_max);
+    }
+
     common_init_result_ptr res(new common_init_result(params, model_only));
 
     llama_model * model = res->model();

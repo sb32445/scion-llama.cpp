@@ -321,9 +321,13 @@ struct common_params_model {
     }
 };
 
+// default MTP draft depth when the target runs on CUDA: there the verify cost grows faster with depth than on Metal
+#define COMMON_SPEC_MTP_N_MAX_CUDA 2
+
 // draft-model-based speculative decoding parameters
 struct common_params_speculative_draft {
     int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
+    bool    n_max_set = false; // set by --spec-draft-n-max; if false, MTP on CUDA uses COMMON_SPEC_MTP_N_MAX_CUDA
     int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
 
     float p_split = 0.1f; // speculative decoding split probability
