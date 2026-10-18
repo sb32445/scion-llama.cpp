@@ -10999,6 +10999,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 64, 1, 1, false, false, 1, false, -1, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1,  2, 1, false, false, 2, true,  -1, true));
 
+    // Verification kernel boundaries, strided inputs, state gathering, raw gates and partial snapshot windows.
+    for (int nt : { 7, 8, 15, 16, 17 }) {
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, nt, 2, 3, true, false, 3));
+        test_cases.emplace_back(
+            new test_gated_delta_net(GGML_TYPE_F32, 4, 128, nt, 2, 3, false, false, 17, true, -1, true));
+    }
+
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 16, 1));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 16, 1, 1, false, true, 3));
+
     // ARC-LAB: GDN rollback by replay - replay chain == snapshot chain (exact), and replay chain vs CPU.
     // steps (n_tokens, rollback): prompt-sized launches (>= 16 tokens: blocked kernel on SYCL), MTP verify launches
     // with partial acceptance, full rejection (rollback = n - 1) and a prompt after pending records.

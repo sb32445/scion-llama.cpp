@@ -1,5 +1,8 @@
 #include "gated_delta_net.cuh"
+#include "gated_delta_net_l8.cuh"
 #include "ggml-cuda/common.cuh"
+
+#include <cstdlib>
 
 // Host and device must agree on columns/warp. Kernel uses __CUDA_ARCH__; host uses ggml_cuda_highest_compiled_arch(cc). NVIDIA Ampere+ and S_v==128 and !KDA -> 4; HIP/MUSA stay 1.
 static constexpr __host__ __device__ int gdn_cols_per_warp(int arch, int S_v, bool KDA) {
@@ -265,6 +268,22 @@ static void launch_gated_delta_net(
             break;
         }
         case 128: {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+            // Opt in until end-to-end measurements establish defaults for each device family.
+            static const bool l8_enabled =
+                getenv("GGML_CUDA_GDN_L8") != nullptr && atoi(getenv("GGML_CUDA_GDN_L8")) != 0;
+            if constexpr (keep_rs_t && !KDA) {
+                if (l8_enabled && GGML_CUDA_CC_IS_NVIDIA(cc) &&
+                    ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_AMPERE && warp_size == 32 &&
+                    cols_per_warp == 4 && n_tokens >= GDN_L8V_MIN_TOKENS && n_tokens <= GDN_L8V_MAX_TOKENS) {
+                    ggml_cuda_kernel_launch(gated_delta_net_l8v_cuda<RAW, G_PRECOMPUTED>, launch_params, q_d, k_d,
+                                            v_d, g_d, b_d, rb_d, ra_d, s_d, dst_d, state_d, H, n_tokens, n_seqs,
+                                            sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1_magic, rq3_magic,
+                                            scale, state_slot_stride, K, s_ids, s_row_stride);
+                    break;
+                }
+            }
+#endif
             ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t, RAW, G_PRECOMPUTED>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
