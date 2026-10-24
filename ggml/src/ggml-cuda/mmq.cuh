@@ -1494,7 +1494,9 @@ static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const i
     return nbs_ids + nbs_x + y_buffers*nbs_y_padded;
 }
 
-#include "mmq-pq2-j128.cuh"
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#include "mmq-pq2-j128.cuh" // NVIDIA-only: inline PTX and CUDA shared-memory carveout
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
 template <ggml_type type, int J, bool fallback>
 static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
