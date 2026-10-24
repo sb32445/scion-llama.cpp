@@ -1,6 +1,8 @@
 #include "argsort.cuh"
 #include "top-k.cuh"
-#include "top-k-select.cuh"
+#ifdef GGML_CUDA_USE_CUB
+#    include "top-k-select.cuh" // NVIDIA-only: 32-bit warp masks; used only on the CUB path below
+#endif
 
 #include <cstdlib>
 
