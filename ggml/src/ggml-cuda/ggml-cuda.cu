@@ -2960,8 +2960,9 @@ static bool ggml_cuda_fwht_q8_find_uses(const ggml_cgraph * cgraph, const int i_
 // mat-vecs quantizes it to q8_1 straight away, so the transform kernel quantizes as it goes and writes
 // the q8_1 rows (in the layout the mat-vecs expect) into its own output buffer; the mat-vecs then skip
 // their quantize launch (ggml_cuda_fwht_q8). On Bonsai 2 that removes ~390 launches per decode step.
-// GGML_CUDA_FWHT_FUSION_PQ2=1 (off by default) also accepts PQ2_0 consumers on the q8_1 AoS layout: the
-// same butterfly and the same per-32 quantizer as the unfused pair, so the q8_1 rows are bit-identical.
+// PQ2_0 consumers are accepted too, on the q8_1 AoS layout or the PQ2 multi-column layout: the same butterfly and the
+// same per-32 quantizer as the unfused pair, so the q8_1 rows are bit-identical. GGML_CUDA_FWHT_FUSION_PQ2=0 limits
+// the fusion to PTQ1_0 consumers and transforms of at most 2048 (the previous default).
 // The check walks every later node, so any other use of the output (or of a view of it) keeps the
 // plain transform, and use counts guard against consumers outside this graph. Returns the number of
 // nodes consumed (3 or 1) or 0 to fall through. GGML_CUDA_FWHT_FUSION=0 disables it.
@@ -2971,7 +2972,7 @@ static int ggml_cuda_try_fwht_q8(ggml_backend_cuda_context & ctx, const ggml_cgr
     if (disabled) {
         return 0;
     }
-    static const bool pq2_enabled = getenv("GGML_CUDA_FWHT_FUSION_PQ2") != nullptr &&
+    static const bool pq2_enabled = getenv("GGML_CUDA_FWHT_FUSION_PQ2") == nullptr ||
                                     atoi(getenv("GGML_CUDA_FWHT_FUSION_PQ2")) != 0;
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_TURING) {
@@ -3051,13 +3052,14 @@ static int ggml_cuda_try_fwht_q8(ggml_backend_cuda_context & ctx, const ggml_cgr
         return 0;
     }
     if (n > 2048 && !pq2_enabled) {
-        return 0; // 4096-wide fused transforms are part of the opt-in for now
+        return 0; // 4096-wide fused transforms go with the PQ2_0 switch
     }
 
     // same (type, ncols, ids) -> layout and padding as ggml_cuda_mul_mat_vec_q
     layout     = ggml_cuda_q8_1_layout_host(wtype, (int) ncols, false);
-    if (layout != GGML_CUDA_Q8_1_AOS && layout != GGML_CUDA_Q8_1_PT && layout != GGML_CUDA_Q8_1_SOA_ISUM) {
-        return 0; // e.g. the Ada PQ2_0 multi-column layout, which the fused quantizer does not write
+    if (layout != GGML_CUDA_Q8_1_AOS && layout != GGML_CUDA_Q8_1_PT && layout != GGML_CUDA_Q8_1_SOA_ISUM &&
+            layout != GGML_CUDA_Q8_1_PQ2) {
+        return 0;
     }
     ne0_padded = GGML_PAD(K, MATRIX_ROW_PADDING);
     if (layout == GGML_CUDA_Q8_1_SOA_ISUM) {
@@ -4451,13 +4453,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // Residual ADD -> RMS_NORM -> MUL(weight) -> MUL(Hadamard signs) -> RESHAPE -> MUL_MAT(Hadamard hint):
     // the input of every Bonsai 2 FFN. One launch instead of three (add, norm, signed transform), bit-identical
     // to them. The residual sum and the rotated activation are the only outputs; the normalized row is not
-    // needed anywhere else (ggml_can_fuse_subgraph checks). GGML_CUDA_NORM_FWHT_FUSION=0 disables it; it also
-    // stands aside when GGML_CUDA_FWHT_FUSION_PQ2 is set, so that opt-in still quantizes in the transform.
+    // needed anywhere else (ggml_can_fuse_subgraph checks). GGML_CUDA_NORM_FWHT_FUSION=0 disables it.
     if (node->op == GGML_OP_ADD && i + 5 < cgraph->n_nodes) {
-        static const bool arf_disabled = (getenv("GGML_CUDA_NORM_FWHT_FUSION") != nullptr &&
-                                          atoi(getenv("GGML_CUDA_NORM_FWHT_FUSION")) == 0) ||
-                                         (getenv("GGML_CUDA_FWHT_FUSION_PQ2") != nullptr &&
-                                          atoi(getenv("GGML_CUDA_FWHT_FUSION_PQ2")) != 0);
+        static const bool arf_disabled = getenv("GGML_CUDA_NORM_FWHT_FUSION") != nullptr &&
+                                         atoi(getenv("GGML_CUDA_NORM_FWHT_FUSION")) == 0;
         ggml_tensor * rms_norm = cgraph->nodes[i + 1];
         ggml_tensor * mul_w    = cgraph->nodes[i + 2];
         ggml_tensor * mul_s    = cgraph->nodes[i + 3];
@@ -4514,10 +4513,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // transform's output buffer (it is written early) and no node stream concurrency is active.
     if (node->op == GGML_OP_RMS_NORM && i + 4 < cgraph->n_nodes &&
             cuda_ctx->stream_context().concurrent_events.empty()) {
-        static const bool rf_disabled = (getenv("GGML_CUDA_NORM_FWHT_FUSION") != nullptr &&
-                                         atoi(getenv("GGML_CUDA_NORM_FWHT_FUSION")) == 0) ||
-                                        (getenv("GGML_CUDA_FWHT_FUSION_PQ2") != nullptr &&
-                                         atoi(getenv("GGML_CUDA_FWHT_FUSION_PQ2")) != 0);
+        static const bool rf_disabled = getenv("GGML_CUDA_NORM_FWHT_FUSION") != nullptr &&
+                                        atoi(getenv("GGML_CUDA_NORM_FWHT_FUSION")) == 0;
         ggml_tensor * mul_w = cgraph->nodes[i + 1];
         const ggml_tensor * x = node->src[0];
         const int64_t ncols = node->ne[0];

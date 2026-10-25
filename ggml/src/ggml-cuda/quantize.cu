@@ -255,6 +255,17 @@ static __global__ void fwht_quantize_q8_1(
                 half2 * ds = (half2 *) (ycol + 8*nblk*16) + kb*4 + e / QK8_1;
                 *ds = make_half2(__float2half(d), __short_as_half((short) isum));
             }
+        } else if constexpr (layout == GGML_CUDA_Q8_1_PQ2) {
+            char * ycol = (char *) vy + row * (ne0 * 9 / 8);
+            const int64_t kb = i0 / QK8_1;
+            const int     e  = iqs;
+            ((int8_t *) ycol)[kb*QK8_1 + (e / 16)*16 + (e % 4)*4 + (e % 16)/4] = q;
+
+            int isum = q;
+            isum = warp_reduce_sum<QK8_1>(isum);
+            if (iqs == 0) {
+                ((half2 *) (ycol + ne0))[kb] = make_half2(__float2half(d), __short_as_half((short) isum));
+            }
         } else if constexpr (layout == GGML_CUDA_Q8_1_SOA_ISUM) {
             int isum = q;
             isum = warp_reduce_sum<QK8_1>(isum);
@@ -295,6 +306,7 @@ static void fwht_quantize_launch_nt(
     switch (layout) {
         case GGML_CUDA_Q8_1_PT:       FWHT_Q_LAUNCH(GGML_CUDA_Q8_1_PT);       break;
         case GGML_CUDA_Q8_1_SOA_ISUM: FWHT_Q_LAUNCH(GGML_CUDA_Q8_1_SOA_ISUM); break;
+        case GGML_CUDA_Q8_1_PQ2:      FWHT_Q_LAUNCH(GGML_CUDA_Q8_1_PQ2);      break;
         default:                      FWHT_Q_LAUNCH(GGML_CUDA_Q8_1_AOS);      break;
     }
 #undef FWHT_Q_LAUNCH
