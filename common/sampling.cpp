@@ -594,6 +594,9 @@ struct common_sampler * common_sampler_init(
         /* .prev    = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
         /* .cur     = */ {},
         /* .cur_p   = */ {},
+        /* .fast_topk = */ 0,
+        /* .fast_topk_mask = */ {},
+        /* .logits_masked  = */ {},
     };
 
     // a logit bias that only masks tokens (-INFINITY) still allows the fast top-k, with these tokens masked
