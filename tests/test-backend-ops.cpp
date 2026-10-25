@@ -5254,6 +5254,155 @@ struct test_fwht_signed : public test_case {
     }
 };
 
+// Residual ADD -> RMS_NORM -> MUL(weight) -> MUL(signs) -> RESHAPE -> Hadamard MUL_MAT: the FFN input of a
+// Bonsai 2 layer, which the CUDA backend runs as one kernel. The residual sum is also used by the final ADD, as
+// the next residual add uses it in the model, so both fused outputs are checked.
+struct test_add_rms_norm_fwht : public test_case {
+    const int64_t n;
+    const int64_t n_tokens;
+
+    test_add_rms_norm_fwht(int64_t n = 4096, int64_t n_tokens = 1) : n(n), n_tokens(n_tokens) {}
+
+    std::string vars() override {
+        return VARS_TO_STR2(n, n_tokens);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "ADD_RMS_NORM_HADAMARD";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * h = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, n);
+        ggml_set_name(h, "h");
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, n_tokens);
+        ggml_set_name(a, "x_a");
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, n_tokens);
+        ggml_set_name(b, "x_b");
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+        ggml_set_name(w, "w");
+        ggml_tensor * s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+        ggml_set_name(s, "s");
+
+        ggml_tensor * sum = ggml_add(ctx, a, b);
+        ggml_tensor * cur = ggml_rms_norm(ctx, sum, 1e-6f);
+        cur = ggml_mul(ctx, cur, w);
+        cur = ggml_mul(ctx, cur, s);
+        cur = ggml_reshape_2d(ctx, cur, n, n_tokens);
+        ggml_tensor * mm = ggml_mul_mat(ctx, h, cur);
+        ggml_mul_mat_set_hint(mm, GGML_HINT_SRC0_IS_HADAMARD);
+        ggml_tensor * out = ggml_add(ctx, mm, sum);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "h") == 0) {
+                const int64_t n_cols = t->ne[0];
+                std::vector<float> data(n_cols * n_cols);
+                const float scale = 1.0f / sqrtf((float) n_cols);
+                for (int64_t r = 0; r < n_cols; r++) {
+                    for (int64_t i = 0; i < n_cols; i++) {
+                        int pop = 0;
+                        for (int64_t val = r & i; val; val >>= 1) {
+                            pop += val & 1;
+                        }
+                        data[r*n_cols + i] = (pop % 2 == 0) ? scale : -scale;
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (strcmp(t->name, "s") == 0) {
+                std::vector<float> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); i++) {
+                    data[i] = (i % 3 == 0) ? -1.0f : 1.0f;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t->type == GGML_TYPE_F32) {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// RMS_NORM -> MUL(weight), then unrelated nodes and a second reader of the normalized row, then MUL(signs) -> RESHAPE ->
+// Hadamard MUL_MAT: the attention input at the start of a Bonsai 2 layer (conv-state reads and ssm_alpha/ssm_beta in
+// between). The CUDA backend computes the norm and the transform in one launch at the norm's position.
+struct test_rms_norm_fwht_lookahead : public test_case {
+    const int64_t n;
+    const int64_t n_tokens;
+
+    test_rms_norm_fwht_lookahead(int64_t n = 4096, int64_t n_tokens = 1) : n(n), n_tokens(n_tokens) {}
+
+    std::string vars() override {
+        return VARS_TO_STR2(n, n_tokens);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_HADAMARD_LOOKAHEAD";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * h  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, n);
+        ggml_set_name(h, "h");
+        ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, n_tokens);
+        ggml_set_name(x, "x_in");
+        ggml_tensor * y  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, n_tokens);
+        ggml_set_name(y, "y_other");
+        ggml_tensor * wa = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, 32);
+        ggml_set_name(wa, "w_alpha");
+        ggml_tensor * w  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+        ggml_set_name(w, "w");
+        ggml_tensor * s  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+        ggml_set_name(s, "s");
+
+        ggml_tensor * nw = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w);
+        // between the norm and the transform: unrelated work and another reader of the normalized row
+        ggml_tensor * other = ggml_add(ctx, ggml_mul_mat(ctx, wa, nw), ggml_scale(ctx, y, 0.5f));
+        ggml_tensor * cur = ggml_mul(ctx, nw, s);
+        cur = ggml_reshape_2d(ctx, cur, n, n_tokens);
+        ggml_tensor * mm = ggml_mul_mat(ctx, h, cur);
+        ggml_mul_mat_set_hint(mm, GGML_HINT_SRC0_IS_HADAMARD);
+        // the first operand's subtree comes first in node order, so `other` lands between the norm and the transform
+        ggml_tensor * out = ggml_concat(ctx, other, mm, 0);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "h") == 0) {
+                const int64_t n_cols = t->ne[0];
+                std::vector<float> data(n_cols * n_cols);
+                const float scale = 1.0f / sqrtf((float) n_cols);
+                for (int64_t r = 0; r < n_cols; r++) {
+                    for (int64_t i = 0; i < n_cols; i++) {
+                        int pop = 0;
+                        for (int64_t val = r & i; val; val >>= 1) {
+                            pop += val & 1;
+                        }
+                        data[r*n_cols + i] = (pop % 2 == 0) ? scale : -scale;
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (strcmp(t->name, "s") == 0) {
+                std::vector<float> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); i++) {
+                    data[i] = (i % 3 == 0) ? -1.0f : 1.0f;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t->type == GGML_TYPE_F32) {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // ARC-LAB fusion tests (arctune, 2026-10-05): each builds the exact node pattern one SYCL fusion matches, at several
 // shapes / token counts, and compares the fused outputs against the CPU backend. The graph's final node only keeps every
 // output alive; its operand order makes the graph come out in the model's node order. `seed` repeats a case with fresh
@@ -10119,6 +10268,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 128, 32, 128));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 2048, 1, 2048));
     test_cases.emplace_back(new test_fwht_signed(1024, 5120, 1));
+    for (int64_t n : {1024, 2048, 4096}) {
+        for (int64_t n_tokens : {1, 4, 8, 33}) {
+            test_cases.emplace_back(new test_add_rms_norm_fwht(n, n_tokens));
+        }
+    }
+    for (int64_t n : {1024, 4096}) {
+        for (int64_t n_tokens : {1, 4, 8, 33}) {
+            test_cases.emplace_back(new test_rms_norm_fwht_lookahead(n, n_tokens));
+        }
+    }
     test_cases.emplace_back(new test_fwht_signed(1024, 5120, 32));
     test_cases.emplace_back(new test_fwht_signed(1024, 6144, 7, GGML_TYPE_F16));
     test_cases.emplace_back(new test_fwht_signed(1024, 17408, 3));

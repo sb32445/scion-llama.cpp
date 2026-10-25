@@ -4226,6 +4226,26 @@ static int ggml_cuda_try_mmvf_pair(ggml_backend_cuda_context & ctx, ggml_cgraph 
     return j - i;
 }
 
+// Whether the Hadamard transform at node i_mm feeds a PTQ1_0 mat-mul (directly or through a reshape of it) within the
+// next few nodes. ggml_cuda_try_fwht_q8 fuses those transforms with their q8_1 quantization by default, so the
+// norm + transform fusions leave them to it.
+static bool ggml_cuda_hadamard_feeds_ptq1(const ggml_cgraph * cgraph, int i_mm) {
+    const ggml_tensor * mm = cgraph->nodes[i_mm];
+    const ggml_tensor * alias = mm;
+    for (int k = i_mm + 1; k < cgraph->n_nodes && k <= i_mm + 8; ++k) {
+        const ggml_tensor * t = cgraph->nodes[k];
+        if (t->op == GGML_OP_RESHAPE && t->src[0] == mm) {
+            alias = t;
+            continue;
+        }
+        if (t->op == GGML_OP_MUL_MAT && (t->src[1] == mm || t->src[1] == alias) && t->src[0] &&
+                t->src[0]->type == GGML_TYPE_PTQ1_0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -4309,6 +4329,141 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 ggml_cuda_mul_mat_q_fused_two(*cuda_ctx, mm_a->src[0], mm_b->src[0], node,
                                                mm_a, mm_b, weight, row_scale.get());
                 return 4;
+            }
+        }
+    }
+
+    // Residual ADD -> RMS_NORM -> MUL(weight) -> MUL(Hadamard signs) -> RESHAPE -> MUL_MAT(Hadamard hint):
+    // the input of every Bonsai 2 FFN. One launch instead of three (add, norm, signed transform), bit-identical
+    // to them. The residual sum and the rotated activation are the only outputs; the normalized row is not
+    // needed anywhere else (ggml_can_fuse_subgraph checks). GGML_CUDA_NORM_FWHT_FUSION=0 disables it; it also
+    // stands aside when GGML_CUDA_FWHT_FUSION_PQ2 is set, so that opt-in still quantizes in the transform.
+    if (node->op == GGML_OP_ADD && i + 5 < cgraph->n_nodes) {
+        static const bool arf_disabled = (getenv("GGML_CUDA_NORM_FWHT_FUSION") != nullptr &&
+                                          atoi(getenv("GGML_CUDA_NORM_FWHT_FUSION")) == 0) ||
+                                         (getenv("GGML_CUDA_FWHT_FUSION_PQ2") != nullptr &&
+                                          atoi(getenv("GGML_CUDA_FWHT_FUSION_PQ2")) != 0);
+        ggml_tensor * rms_norm = cgraph->nodes[i + 1];
+        ggml_tensor * mul_w    = cgraph->nodes[i + 2];
+        ggml_tensor * mul_s    = cgraph->nodes[i + 3];
+        ggml_tensor * reshape  = cgraph->nodes[i + 4];
+        ggml_tensor * mm       = cgraph->nodes[i + 5];
+        const ggml_op ops[]       = { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT };
+        const int     out_nodes[] = { i, i + 5 };
+        if (!arf_disabled && GGML_CUDA_CC_IS_NVIDIA(ggml_cuda_info().devices[ggml_cuda_get_device()].cc) &&
+                rms_norm->op == GGML_OP_RMS_NORM && mul_w->op == GGML_OP_MUL && mul_s->op == GGML_OP_MUL &&
+                reshape->op == GGML_OP_RESHAPE && mm->op == GGML_OP_MUL_MAT &&
+                rms_norm->src[0] == node && (mul_w->src[0] == rms_norm || mul_w->src[1] == rms_norm) &&
+                mul_s->src[0] == mul_w && reshape->src[0] == mul_s && mm->src[1] == reshape &&
+                ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
+            const ggml_tensor * a      = node->src[0];
+            const ggml_tensor * b      = node->src[1];
+            const ggml_tensor * weight = mul_w->src[0] == rms_norm ? mul_w->src[1] : mul_w->src[0];
+            const ggml_tensor * signs  = mul_s->src[1];
+            const int64_t ncols = node->ne[0];
+            if (a && b && weight && signs &&
+                    a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 &&
+                    rms_norm->type == GGML_TYPE_F32 && mul_w->type == GGML_TYPE_F32 && mul_s->type == GGML_TYPE_F32 &&
+                    weight->type == GGML_TYPE_F32 && signs->type == GGML_TYPE_F32 && mm->type == GGML_TYPE_F32 &&
+                    ggml_are_same_shape(a, b) && ggml_are_same_shape(a, node) && ggml_are_same_shape(node, rms_norm) &&
+                    ggml_are_same_shape(rms_norm, mul_w) && ggml_are_same_shape(mul_w, mul_s) &&
+                    ggml_is_contiguous(a) && ggml_is_contiguous(b) && ggml_is_contiguous(node) &&
+                    ggml_is_contiguous(weight) && ggml_is_contiguous(signs) && ggml_is_contiguous(mm) &&
+                    weight->ne[0] == ncols && ggml_nrows(weight) == 1 &&
+                    signs->ne[0] == ncols && ggml_nrows(signs) == 1 &&
+                    mm->src[0]->ne[0] == ncols && mm->ne[0] == ncols && ggml_nelements(mm) == ggml_nelements(node) &&
+                    ggml_cuda_add_rms_norm_fwht_supported((int) ncols) && !ggml_cuda_hadamard_feeds_ptq1(cgraph, i + 5) &&
+                    weight->data != node->data && signs->data != node->data &&
+                    weight->data != mm->data && signs->data != mm->data &&
+                    ggml_can_fuse_subgraph(cgraph, i, 6, ops, out_nodes, 2) &&
+                    ggml_cuda_check_fusion_memory_ranges(cgraph, i, 6, out_nodes, 2, false, true)) {
+                ggml_cuda_op_add_rms_norm_fwht_fused(*cuda_ctx, node, rms_norm, weight, signs, nullptr, mm);
+                return 5;
+            }
+        }
+    }
+
+    // RMS_NORM -> MUL(weight) ... MUL(Hadamard signs) -> RESHAPE -> MUL_MAT(Hadamard hint), with unrelated nodes in
+    // between: the attention input at the start of every Bonsai 2 layer, where the recurrent conv-state reads sit
+    // between the norm and the transform, and the normalized row also feeds ssm_alpha/ssm_beta. The norm, the
+    // normalized row and the transform are computed here in one launch; the sign MUL, RESHAPE and transform nodes are
+    // recorded as precomputed and skipped when the loop reaches them. Bit-identical to rms_norm_f32<1024> with the
+    // multiply followed by the signed transform. Only taken when none of the nodes in between touches the
+    // transform's output buffer (it is written early) and no node stream concurrency is active.
+    if (node->op == GGML_OP_RMS_NORM && i + 4 < cgraph->n_nodes &&
+            cuda_ctx->stream_context().concurrent_events.empty()) {
+        static const bool rf_disabled = (getenv("GGML_CUDA_NORM_FWHT_FUSION") != nullptr &&
+                                         atoi(getenv("GGML_CUDA_NORM_FWHT_FUSION")) == 0) ||
+                                        (getenv("GGML_CUDA_FWHT_FUSION_PQ2") != nullptr &&
+                                         atoi(getenv("GGML_CUDA_FWHT_FUSION_PQ2")) != 0);
+        ggml_tensor * mul_w = cgraph->nodes[i + 1];
+        const ggml_tensor * x = node->src[0];
+        const int64_t ncols = node->ne[0];
+        const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+        if (!rf_disabled && GGML_CUDA_CC_IS_NVIDIA(cc) && mul_w->op == GGML_OP_MUL &&
+                (mul_w->src[0] == node || mul_w->src[1] == node) && x && x->type == GGML_TYPE_F32 &&
+                node->type == GGML_TYPE_F32 && mul_w->type == GGML_TYPE_F32 && ggml_is_contiguous(x) &&
+                ggml_is_contiguous(node) && ggml_is_contiguous(mul_w) && ggml_are_same_shape(x, node) &&
+                ggml_are_same_shape(node, mul_w) && ggml_cuda_add_rms_norm_fwht_supported((int) ncols) &&
+                ggml_node_get_use_count(cgraph, i) == 1) {
+            const ggml_tensor * weight = mul_w->src[0] == node ? mul_w->src[1] : mul_w->src[0];
+            // the sign MUL of this normalized row, a few nodes later
+            int j = -1;
+            for (int k = i + 2; k + 2 < cgraph->n_nodes && k <= i + 16; ++k) {
+                const ggml_tensor * t = cgraph->nodes[k];
+                if (t->op == GGML_OP_MUL && t->src[0] == mul_w) {
+                    j = k;
+                    break;
+                }
+            }
+            ggml_tensor * mul_s   = j >= 0 ? cgraph->nodes[j]     : nullptr;
+            ggml_tensor * reshape = j >= 0 ? cgraph->nodes[j + 1] : nullptr;
+            ggml_tensor * mm      = j >= 0 ? cgraph->nodes[j + 2] : nullptr;
+            const ggml_tensor * signs = mul_s ? mul_s->src[1] : nullptr;
+            // weight and signs are read now: they must be leaves (model tensors), not results of the nodes in between
+            bool ok = mul_s && weight && signs && weight->op == GGML_OP_NONE && signs->op == GGML_OP_NONE &&
+                reshape->op == GGML_OP_RESHAPE && reshape->src[0] == mul_s &&
+                mm->op == GGML_OP_MUL_MAT && mm->src[1] == reshape &&
+                ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD &&
+                mul_s->type == GGML_TYPE_F32 && ggml_are_same_shape(mul_s, mul_w) &&
+                weight->type == GGML_TYPE_F32 && ggml_is_contiguous(weight) && weight->ne[0] == ncols && ggml_nrows(weight) == 1 &&
+                signs->type == GGML_TYPE_F32 && ggml_is_contiguous(signs) && signs->ne[0] == ncols && ggml_nrows(signs) == 1 &&
+                mm->type == GGML_TYPE_F32 && ggml_is_contiguous(mm) && mm->src[0]->ne[0] == ncols && mm->ne[0] == ncols &&
+                ggml_nelements(mm) == ggml_nelements(node) && !(mm->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+                ggml_node_get_use_count(cgraph, j) == 1 && ggml_node_get_use_count(cgraph, j + 1) == 1 &&
+                !ggml_cuda_hadamard_feeds_ptq1(cgraph, j + 2);
+            auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+                if (!a || !b || !a->data || !b->data) {
+                    return false;
+                }
+                const char * a0 = (const char *) a->data;
+                const char * b0 = (const char *) b->data;
+                return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+            };
+            // mm is written now instead of at j + 2: it must not share memory with the norm's inputs and outputs
+            // or with anything the nodes in between read or write
+            ok = ok && !overlaps(mm, x) && !overlaps(mm, mul_w) && !overlaps(mm, weight) && !overlaps(mm, signs);
+            for (int k = i + 2; ok && k < j; ++k) {
+                const ggml_tensor * t = cgraph->nodes[k];
+                if (overlaps(mm, t)) {
+                    ok = false;
+                }
+                for (int s = 0; ok && s < GGML_MAX_SRC; ++s) {
+                    if (t->src[s] == mul_w || t->src[s] == node) {
+                        continue; // reading the normalized row (alpha/beta) is fine, it is written here too
+                    }
+                    if (overlaps(mm, t->src[s])) {
+                        ok = false;
+                    }
+                }
+            }
+            if (ok) {
+                ggml_cuda_op_add_rms_norm_fwht_fused(*cuda_ctx, nullptr, node, weight, signs, mul_w, mm);
+                auto & pre = cuda_ctx->fwht_q8().precomputed;
+                pre.insert(mul_s);
+                pre.insert(reshape);
+                pre.insert(mm);
+                return 1;
             }
         }
     }
@@ -5326,6 +5481,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
                 prev_i = i;
+
+                if (!cuda_ctx->fwht_q8().precomputed.empty() && cuda_ctx->fwht_q8().precomputed.count(node)) {
+                    continue; // computed ahead of its position by a look-ahead fusion in ggml_cuda_try_fuse
+                }
 
                 if (ggml_cuda_is_view_or_noop(node)) {
                     continue;
