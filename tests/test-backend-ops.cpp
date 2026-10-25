@@ -5279,11 +5279,14 @@ struct test_add_rms_norm_fwht : public test_case {
     const int64_t n_tokens;
     const ggml_type type_mm;
 
-    test_add_rms_norm_fwht(int64_t n = 4096, int64_t n_tokens = 1, ggml_type type_mm = GGML_TYPE_COUNT)
-        : n(n), n_tokens(n_tokens), type_mm(type_mm) {}
+    const int64_t blk; // Hadamard block width (block-diagonal transform over n), n if 0
+
+    test_add_rms_norm_fwht(int64_t n = 4096, int64_t n_tokens = 1, ggml_type type_mm = GGML_TYPE_COUNT, int64_t blk = 0)
+        : n(n), n_tokens(n_tokens), type_mm(type_mm), blk(blk) {}
 
     std::string vars() override {
-        return type_mm == GGML_TYPE_COUNT ? VARS_TO_STR2(n, n_tokens) : VARS_TO_STR3(n, n_tokens, type_mm);
+        std::string v = type_mm == GGML_TYPE_COUNT ? VARS_TO_STR2(n, n_tokens) : VARS_TO_STR3(n, n_tokens, type_mm);
+        return blk ? v + "," + VAR_TO_STR(blk) : v;
     }
 
     double max_nmse_err() override { return type_mm == GGML_TYPE_COUNT ? 1e-7 : 5e-4; }
@@ -5296,7 +5299,8 @@ struct test_add_rms_norm_fwht : public test_case {
     bool run_whole_graph() override { return true; }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * h = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, n);
+        const int64_t bw = blk ? blk : n;
+        ggml_tensor * h = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, bw, bw);
         ggml_set_name(h, "h");
         ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, n_tokens);
         ggml_set_name(a, "x_a");
@@ -5311,9 +5315,12 @@ struct test_add_rms_norm_fwht : public test_case {
         ggml_tensor * cur = ggml_rms_norm(ctx, sum, 1e-6f);
         cur = ggml_mul(ctx, cur, w);
         cur = ggml_mul(ctx, cur, s);
-        cur = ggml_reshape_2d(ctx, cur, n, n_tokens);
+        cur = ggml_reshape_2d(ctx, cur, bw, n_tokens*n/bw);
         ggml_tensor * mm = ggml_mul_mat(ctx, h, cur);
         ggml_mul_mat_set_hint(mm, GGML_HINT_SRC0_IS_HADAMARD);
+        if (bw != n) {
+            mm = ggml_reshape_2d(ctx, mm, n, n_tokens);
+        }
         ggml_tensor * out;
         if (type_mm == GGML_TYPE_COUNT) {
             out = ggml_add(ctx, mm, sum);
@@ -5366,11 +5373,14 @@ struct test_rms_norm_fwht_lookahead : public test_case {
     const int64_t n_tokens;
     const ggml_type type_mm;
 
-    test_rms_norm_fwht_lookahead(int64_t n = 4096, int64_t n_tokens = 1, ggml_type type_mm = GGML_TYPE_COUNT)
-        : n(n), n_tokens(n_tokens), type_mm(type_mm) {}
+    const int64_t blk; // Hadamard block width (block-diagonal transform over n), n if 0
+
+    test_rms_norm_fwht_lookahead(int64_t n = 4096, int64_t n_tokens = 1, ggml_type type_mm = GGML_TYPE_COUNT, int64_t blk = 0)
+        : n(n), n_tokens(n_tokens), type_mm(type_mm), blk(blk) {}
 
     std::string vars() override {
-        return type_mm == GGML_TYPE_COUNT ? VARS_TO_STR2(n, n_tokens) : VARS_TO_STR3(n, n_tokens, type_mm);
+        std::string v = type_mm == GGML_TYPE_COUNT ? VARS_TO_STR2(n, n_tokens) : VARS_TO_STR3(n, n_tokens, type_mm);
+        return blk ? v + "," + VAR_TO_STR(blk) : v;
     }
 
     double max_nmse_err() override { return type_mm == GGML_TYPE_COUNT ? 1e-7 : 5e-4; }
@@ -5383,7 +5393,8 @@ struct test_rms_norm_fwht_lookahead : public test_case {
     bool run_whole_graph() override { return true; }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * h  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, n);
+        const int64_t bw = blk ? blk : n;
+        ggml_tensor * h  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, bw, bw);
         ggml_set_name(h, "h");
         ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, n_tokens);
         ggml_set_name(x, "x_in");
@@ -5400,9 +5411,12 @@ struct test_rms_norm_fwht_lookahead : public test_case {
         // between the norm and the transform: unrelated work and another reader of the normalized row
         ggml_tensor * other = ggml_add(ctx, ggml_mul_mat(ctx, wa, nw), ggml_scale(ctx, y, 0.5f));
         ggml_tensor * cur = ggml_mul(ctx, nw, s);
-        cur = ggml_reshape_2d(ctx, cur, n, n_tokens);
+        cur = ggml_reshape_2d(ctx, cur, bw, n_tokens*n/bw);
         ggml_tensor * mm = ggml_mul_mat(ctx, h, cur);
         ggml_mul_mat_set_hint(mm, GGML_HINT_SRC0_IS_HADAMARD);
+        if (bw != n) {
+            mm = ggml_reshape_2d(ctx, mm, n, n_tokens);
+        }
         // the first operand's subtree comes first in node order, so `other` lands between the norm and the transform
         ggml_tensor * out;
         if (type_mm == GGML_TYPE_COUNT) {
@@ -10335,6 +10349,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t n : {1024, 4096}) {
         for (int64_t n_tokens : {1, 4, 8, 33}) {
             test_cases.emplace_back(new test_rms_norm_fwht_lookahead(n, n_tokens));
+        }
+    }
+    // block-diagonal transforms (Bonsai 2 2B: 512-wide blocks over a 2048-wide row), plain and with PQ2_0 consumers
+    for (int64_t blk : {512, 1024}) {
+        for (int64_t n_tokens : {1, 4, 8, 33}) {
+            test_cases.emplace_back(new test_add_rms_norm_fwht(2048, n_tokens, GGML_TYPE_COUNT, blk));
+            test_cases.emplace_back(new test_rms_norm_fwht_lookahead(2048, n_tokens, GGML_TYPE_COUNT, blk));
+            test_cases.emplace_back(new test_add_rms_norm_fwht(2048, n_tokens, GGML_TYPE_PQ2_0, blk));
+            test_cases.emplace_back(new test_rms_norm_fwht_lookahead(2048, n_tokens, GGML_TYPE_PQ2_0, blk));
         }
     }
     // the same with PQ2_0 consumers: q8_1 quantized in the fused kernel (1 column: AoS, 3-8 columns: PQ2 layout)

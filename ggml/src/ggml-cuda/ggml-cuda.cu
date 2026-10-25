@@ -4486,8 +4486,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     ggml_is_contiguous(weight) && ggml_is_contiguous(signs) && ggml_is_contiguous(mm) &&
                     weight->ne[0] == ncols && ggml_nrows(weight) == 1 &&
                     signs->ne[0] == ncols && ggml_nrows(signs) == 1 &&
-                    mm->src[0]->ne[0] == ncols && mm->ne[0] == ncols && ggml_nelements(mm) == ggml_nelements(node) &&
-                    ggml_cuda_add_rms_norm_fwht_supported((int) ncols) && !ggml_cuda_hadamard_feeds_ptq1(cgraph, i + 5) &&
+                    mm->ne[0] == mm->src[0]->ne[0] && ggml_nelements(mm) == ggml_nelements(node) &&
+                    ggml_cuda_add_rms_norm_fwht_supported((int) ncols, (int) mm->src[0]->ne[0]) &&
+                    !ggml_cuda_hadamard_feeds_ptq1(cgraph, i + 5) &&
                     weight->data != node->data && signs->data != node->data &&
                     weight->data != mm->data && signs->data != mm->data &&
                     ggml_can_fuse_subgraph(cgraph, i, 6, ops, out_nodes, 2) &&
@@ -4525,7 +4526,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 (mul_w->src[0] == node || mul_w->src[1] == node) && x && x->type == GGML_TYPE_F32 &&
                 node->type == GGML_TYPE_F32 && mul_w->type == GGML_TYPE_F32 && ggml_is_contiguous(x) &&
                 ggml_is_contiguous(node) && ggml_is_contiguous(mul_w) && ggml_are_same_shape(x, node) &&
-                ggml_are_same_shape(node, mul_w) && ggml_cuda_add_rms_norm_fwht_supported((int) ncols) &&
+                ggml_are_same_shape(node, mul_w) && ggml_cuda_add_rms_norm_fwht_supported((int) ncols, 512) &&
                 ggml_node_get_use_count(cgraph, i) == 1) {
             const ggml_tensor * weight = mul_w->src[0] == node ? mul_w->src[1] : mul_w->src[0];
             // the sign MUL of this normalized row, a few nodes later
@@ -4549,7 +4550,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 mul_s->type == GGML_TYPE_F32 && ggml_are_same_shape(mul_s, mul_w) &&
                 weight->type == GGML_TYPE_F32 && ggml_is_contiguous(weight) && weight->ne[0] == ncols && ggml_nrows(weight) == 1 &&
                 signs->type == GGML_TYPE_F32 && ggml_is_contiguous(signs) && signs->ne[0] == ncols && ggml_nrows(signs) == 1 &&
-                mm->type == GGML_TYPE_F32 && ggml_is_contiguous(mm) && mm->src[0]->ne[0] == ncols && mm->ne[0] == ncols &&
+                mm->type == GGML_TYPE_F32 && ggml_is_contiguous(mm) && mm->ne[0] == mm->src[0]->ne[0] &&
+                ggml_cuda_add_rms_norm_fwht_supported((int) ncols, (int) mm->src[0]->ne[0]) &&
                 ggml_nelements(mm) == ggml_nelements(node) && !(mm->flags & GGML_TENSOR_FLAG_OUTPUT) &&
                 ggml_node_get_use_count(cgraph, j) == 1 && ggml_node_get_use_count(cgraph, j + 1) == 1 &&
                 !ggml_cuda_hadamard_feeds_ptq1(cgraph, j + 2);

@@ -3,15 +3,19 @@
 // In-register block FWHT over N floats held as NE = N/NT per thread, element i*NT + tid in reg[i].
 // Shared by the standalone kernel (fwht_cuda_block) and the fused FWHT + q8_1 quantizer so both
 // produce bit-identical transforms. `s` must hold N floats.
-template <int N, int NT>
+// B < N: independent transforms of width B over consecutive B-element segments (a block-diagonal Hadamard), i.e. only
+// the stages with stride < B. Each stage is the same add/subtract whichever level runs it, so a segment's result is
+// bit-identical to a width-B transform.
+template <int N, int NT, int B = N>
 __device__ __forceinline__ void ggml_cuda_fwht_block_butterfly(float * reg, float * s, const int tid, const int lane) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int NE        = N / NT;
     static_assert(NE >= 1 && N % NT == 0 && NT % warp_size == 0, "bad FWHT block shape");
+    static_assert(B <= N && N % B == 0 && B >= warp_size, "bad FWHT segment width");
 
     // stages within a warp: partner differs in the lane bits
 #pragma unroll
-    for (int h = 1; h < warp_size; h *= 2) {
+    for (int h = 1; h < warp_size && h < B; h *= 2) {
 #pragma unroll
         for (int j = 0; j < NE; j++) {
             const float val  = reg[j];
@@ -22,7 +26,7 @@ __device__ __forceinline__ void ggml_cuda_fwht_block_butterfly(float * reg, floa
 
     // stages across warps: partner differs in the thread-index bits above the lane
 #pragma unroll
-    for (int h = warp_size; h < NT; h *= 2) {
+    for (int h = warp_size; h < NT && h < B; h *= 2) {
 #pragma unroll
         for (int j = 0; j < NE; j++) {
             s[j * NT + tid] = reg[j];
@@ -39,7 +43,7 @@ __device__ __forceinline__ void ggml_cuda_fwht_block_butterfly(float * reg, floa
 
     // stages above the block width: partner is another register of the same thread
 #pragma unroll
-    for (int h = NT; h < N; h *= 2) {
+    for (int h = NT; h < B; h *= 2) {
         const int step = h / NT;
 #pragma unroll
         for (int j = 0; j < NE; j += 2 * step) {

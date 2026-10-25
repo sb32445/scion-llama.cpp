@@ -627,7 +627,7 @@ void ggml_cuda_op_add_rms_norm_fused(
 // mat-vecs expect (AOS: 1 column; PQ2: the PQ2_0 multi-column path), with the same per-32 arithmetic and stores as
 // quantize_q8_1<layout>, so the q8_1 rows are bit-identical to quantizing the F32 result. dst then holds the q8_1 rows
 // (N/32 block_q8_1 per row, the row width needs no padding).
-template <int N, bool has_add, bool q8, ggml_cuda_q8_1_layout layout>
+template <int N, int B, bool has_add, bool q8, ggml_cuda_q8_1_layout layout>
 static __global__ void __launch_bounds__(1024, 1) add_rms_norm_fwht_f32(
         const float * a, const float * b, const float * weight, const float * signs,
         float * sum, float * normed, void * dst_ptr, const float eps, const float fwht_scale) {
@@ -681,7 +681,7 @@ static __global__ void __launch_bounds__(1024, 1) add_rms_norm_fwht_f32(
         reg[i] *= signs[col];
     }
 
-    ggml_cuda_fwht_block_butterfly<N, NT>(reg, s_fwht, tid, lane);
+    ggml_cuda_fwht_block_butterfly<N, NT, B>(reg, s_fwht, tid, lane);
 
     if constexpr (!q8) {
         float * dst = (float *) dst_ptr + row*N;
@@ -725,8 +725,11 @@ static __global__ void __launch_bounds__(1024, 1) add_rms_norm_fwht_f32(
     }
 }
 
-bool ggml_cuda_add_rms_norm_fwht_supported(const int ncols) {
-    return ncols == 1024 || ncols == 2048 || ncols == 4096;
+// ncols: the row width; blk: the Hadamard block width (the transform matrix is blk x blk, applied to each blk-element
+// segment of the row; blk == ncols for a full-row transform)
+bool ggml_cuda_add_rms_norm_fwht_supported(const int ncols, const int blk) {
+    return (ncols == 1024 || ncols == 2048 || ncols == 4096) &&
+           (blk == 512 || blk == 1024 || blk == 2048 || blk == 4096) && blk <= ncols;
 }
 
 void ggml_cuda_op_add_rms_norm_fwht_fused(
@@ -738,47 +741,50 @@ void ggml_cuda_op_add_rms_norm_fwht_fused(
     const ggml_tensor * a = add ? add->src[0] : x;
     const ggml_tensor * b = add ? add->src[1] : nullptr;
     const int ncols = (int) x->ne[0];
-    GGML_ASSERT(ggml_cuda_add_rms_norm_fwht_supported(ncols));
+    const int blk   = (int) dst->src[0]->ne[0];
+    GGML_ASSERT(ggml_cuda_add_rms_norm_fwht_supported(ncols, blk));
     GGML_ASSERT(ggml_nelements(dst) == ggml_nelements(x));
 
     float eps;
     memcpy(&eps, rms_norm->op_params, sizeof(float));
     GGML_ASSERT(eps >= 0.0f);
 
-    // fwht_dispatch: scale = 1 / sqrtf(n)
-    const float fwht_scale = 1 / sqrtf(ncols);
+    // fwht_dispatch: scale = 1 / sqrtf(n), n the transform width
+    const float fwht_scale = 1 / sqrtf(blk);
     const int64_t nrows = ggml_nrows(x);
     cudaStream_t stream = ctx.stream();
     float * normed_d = normed ? (float *) normed->data : nullptr;
     void * out = q8 ? q8 : dst->data;
-#define ARF_LAUNCH(NN, ADD, Q8, L) \
-    add_rms_norm_fwht_f32<NN, ADD, Q8, L><<<(unsigned) nrows, 1024, 0, stream>>>( \
+#define ARF_LAUNCH(NN, BB, ADD, Q8, L) \
+    add_rms_norm_fwht_f32<NN, BB, ADD, Q8, L><<<(unsigned) nrows, 1024, 0, stream>>>( \
         (const float *) a->data, ADD ? (const float *) b->data : nullptr, (const float *) weight->data, \
         (const float *) signs->data, ADD ? (float *) add->data : nullptr, normed_d, out, eps, fwht_scale)
-#define ARF_CASE_ADD(NN, ADD) \
+#define ARF_CASE_ADD(NN, BB, ADD) \
     if (!q8) { \
-        ARF_LAUNCH(NN, ADD, false, GGML_CUDA_Q8_1_AOS); \
+        ARF_LAUNCH(NN, BB, ADD, false, GGML_CUDA_Q8_1_AOS); \
     } else if (q8_layout == GGML_CUDA_Q8_1_PQ2) { \
-        ARF_LAUNCH(NN, ADD, true, GGML_CUDA_Q8_1_PQ2); \
+        ARF_LAUNCH(NN, BB, ADD, true, GGML_CUDA_Q8_1_PQ2); \
     } else { \
         GGML_ASSERT(q8_layout == GGML_CUDA_Q8_1_AOS); \
-        ARF_LAUNCH(NN, ADD, true, GGML_CUDA_Q8_1_AOS); \
+        ARF_LAUNCH(NN, BB, ADD, true, GGML_CUDA_Q8_1_AOS); \
     }
-#define ARF_CASE(NN) \
-    case NN: \
+#define ARF_CASE_B(NN, BB) \
+    if (blk == BB) { \
         if (add) { \
-            ARF_CASE_ADD(NN, true) \
+            ARF_CASE_ADD(NN, BB, true) \
         } else { \
-            ARF_CASE_ADD(NN, false) \
+            ARF_CASE_ADD(NN, BB, false) \
         } \
-        break;
-    switch (ncols) {
-        ARF_CASE(1024)
-        ARF_CASE(2048)
-        ARF_CASE(4096)
-        default: GGML_ABORT("unsupported width");
+        return; \
     }
-#undef ARF_CASE
+    switch (ncols) {
+        case 1024: ARF_CASE_B(1024, 512) ARF_CASE_B(1024, 1024) break;
+        case 2048: ARF_CASE_B(2048, 512) ARF_CASE_B(2048, 1024) ARF_CASE_B(2048, 2048) break;
+        case 4096: ARF_CASE_B(4096, 512) ARF_CASE_B(4096, 1024) ARF_CASE_B(4096, 2048) ARF_CASE_B(4096, 4096) break;
+        default: break;
+    }
+    GGML_ABORT("unsupported width %d / block %d", ncols, blk);
+#undef ARF_CASE_B
 #undef ARF_CASE_ADD
 #undef ARF_LAUNCH
 }
