@@ -4140,7 +4140,7 @@ struct test_ssm_conv_bias_silu : public test_case {
 // GET_ROWS (conv state row) -> CONCAT with the new tokens -> CPY of the last window back into a cache row (n_rs == 0),
 // or one CPY per rollback snapshot slot (n_rs > 0: 1 + n_rs slots, as llm_build_delta_net_base::build_conv_state writes
 // them), SSM_CONV -> SILU -> L2_NORM of the leading q/k heads of every token. The CUDA backend can run it as one
-// launch (GGML_CUDA_GDN_FUSION=1); the L2_NORM, the SILU output and the written cache rows are all checked.
+// launch (by default; GGML_CUDA_GDN_FUSION=0 disables it); the L2_NORM, the SILU output and the written cache rows are all checked.
 struct test_gdn_conv_chain : public test_case {
     const int64_t d_conv;
     const int64_t head_dim;  // L2 row length
@@ -4230,7 +4230,7 @@ struct test_gdn_conv_chain : public test_case {
 };
 
 // Two mat-vecs of one activation with same-shape float weights (the GDN alpha and beta projections); the CUDA backend
-// can run them as one launch (GGML_CUDA_GDN_FUSION=1). Both products are checked.
+// can run them as one launch (by default; GGML_CUDA_GDN_FUSION=0 disables it). Both products are checked.
 struct test_mul_mat_vec_pair : public test_case {
     const ggml_type type;
     const int64_t   k;

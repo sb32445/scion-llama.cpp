@@ -3066,7 +3066,7 @@ static int ggml_cuda_try_fwht_q8(ggml_backend_cuda_context & ctx, const ggml_cgr
     return consumed;
 }
 
-// GDN conv chain (GGML_CUDA_GDN_FUSION=1, off by default). For n_t tokens of one sequence (a decode step, n_t = 1, or a
+// GDN conv chain (on by default, GGML_CUDA_GDN_FUSION=0 disables it). For n_t tokens of one sequence (a decode step, n_t = 1, or a
 // speculative verify step, n_t = 2..GGML_CUDA_GDN_CONV_MAX_TOKENS), a hybrid-model gated delta net layer runs these
 // launch-bound kernels between the qkv projection and the GDN op:
 //   GET_ROWS(conv cache, s_copy) -> RESHAPE -> CONCAT(state, qkv^T)
@@ -3080,8 +3080,10 @@ static int ggml_cuda_try_fwht_q8(ggml_backend_cuda_context & ctx, const ggml_cgr
 // of it) must not touch any memory the fused kernel reads or writes. Megakernel-style launch removal in the spirit of
 // Hazy Research's "no bubbles" low-latency decode work, applied as a graph-level fusion rather than a persistent kernel.
 static bool ggml_cuda_gdn_fusion_enabled() {
-    static const bool enabled = getenv("GGML_CUDA_GDN_FUSION") != nullptr &&
-                                atoi(getenv("GGML_CUDA_GDN_FUSION")) != 0;
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_GDN_FUSION");
+        return env == nullptr || atoi(env) != 0;
+    }();
     return enabled;
 }
 
@@ -4218,7 +4220,8 @@ static int ggml_cuda_try_batched_cpy(ggml_backend_cuda_context * cuda_ctx, ggml_
 }
 
 // Two consecutive independent F32/F16/BF16 mat-vecs on the same activation (the GDN alpha and beta projections, which
-// the fused GDN op consumes raw) as one launch, GGML_CUDA_GDN_FUSION=1. Returns the number of nodes consumed.
+// the fused GDN op consumes raw) as one launch (on by default, GGML_CUDA_GDN_FUSION=0 disables it). Returns the
+// number of nodes consumed.
 static int ggml_cuda_try_mmvf_pair(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
     ggml_tensor * mm0 = cgraph->nodes[i];
     int j = i + 1;

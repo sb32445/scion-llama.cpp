@@ -1597,10 +1597,11 @@ struct ggml_cuda_gdn_gather_context {
     }
 };
 
-// GDN decode conv chain fused into one launch (GGML_CUDA_GDN_FUSION=1): the conv-state GET_ROWS is skipped and
-// registered under the CONCAT it feeds; the CONCAT launches the fused kernel, which also computes the conv-state CPY,
-// SSM_CONV + SILU and the q/k L2_NORM, and those nodes are marked done. Keyed by node identity, valid for one graph
-// evaluation, owned by the evaluating context (reset with the other per-evaluation registries).
+// GDN decode conv chain fused into one launch (on by default, GGML_CUDA_GDN_FUSION=0 disables it): the conv-state
+// GET_ROWS is skipped and registered under the CONCAT it feeds; the CONCAT launches the fused kernel, which also
+// computes the conv-state CPY, SSM_CONV + SILU and the q/k L2_NORM, and those nodes are marked done. Keyed by node
+// identity, valid for one graph evaluation, owned by the evaluating context (reset with the other per-evaluation
+// registries).
 struct ggml_cuda_gdn_conv_context {
     std::unordered_map<const ggml_tensor *, const ggml_tensor *> gathers; // CONCAT -> the GET_ROWS it replaces
     std::unordered_set<const ggml_tensor *>                      done;    // nodes computed by a fused launch
