@@ -5272,15 +5272,21 @@ struct test_fwht_signed : public test_case {
 // Residual ADD -> RMS_NORM -> MUL(weight) -> MUL(signs) -> RESHAPE -> Hadamard MUL_MAT: the FFN input of a
 // Bonsai 2 layer, which the CUDA backend runs as one kernel. The residual sum is also used by the final ADD, as
 // the next residual add uses it in the model, so both fused outputs are checked.
+// type_mm != GGML_TYPE_COUNT: the transform feeds two mat-vecs of that type instead (gate and up), which the CUDA
+// backend serves from q8_1 rows quantized in the fused kernel.
 struct test_add_rms_norm_fwht : public test_case {
     const int64_t n;
     const int64_t n_tokens;
+    const ggml_type type_mm;
 
-    test_add_rms_norm_fwht(int64_t n = 4096, int64_t n_tokens = 1) : n(n), n_tokens(n_tokens) {}
+    test_add_rms_norm_fwht(int64_t n = 4096, int64_t n_tokens = 1, ggml_type type_mm = GGML_TYPE_COUNT)
+        : n(n), n_tokens(n_tokens), type_mm(type_mm) {}
 
     std::string vars() override {
-        return VARS_TO_STR2(n, n_tokens);
+        return type_mm == GGML_TYPE_COUNT ? VARS_TO_STR2(n, n_tokens) : VARS_TO_STR3(n, n_tokens, type_mm);
     }
+
+    double max_nmse_err() override { return type_mm == GGML_TYPE_COUNT ? 1e-7 : 5e-4; }
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -5308,7 +5314,16 @@ struct test_add_rms_norm_fwht : public test_case {
         cur = ggml_reshape_2d(ctx, cur, n, n_tokens);
         ggml_tensor * mm = ggml_mul_mat(ctx, h, cur);
         ggml_mul_mat_set_hint(mm, GGML_HINT_SRC0_IS_HADAMARD);
-        ggml_tensor * out = ggml_add(ctx, mm, sum);
+        ggml_tensor * out;
+        if (type_mm == GGML_TYPE_COUNT) {
+            out = ggml_add(ctx, mm, sum);
+        } else {
+            ggml_tensor * wg = ggml_new_tensor_2d(ctx, type_mm, n, 96);
+            ggml_set_name(wg, "w_gate");
+            ggml_tensor * wu = ggml_new_tensor_2d(ctx, type_mm, n, 160);
+            ggml_set_name(wu, "w_up");
+            out = ggml_concat(ctx, ggml_concat(ctx, ggml_mul_mat(ctx, wg, mm), ggml_mul_mat(ctx, wu, mm), 0), sum, 0);
+        }
         ggml_set_name(out, "out");
         return out;
     }
@@ -5335,7 +5350,7 @@ struct test_add_rms_norm_fwht : public test_case {
                     data[i] = (i % 3 == 0) ? -1.0f : 1.0f;
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
-            } else if (t->type == GGML_TYPE_F32) {
+            } else {
                 init_tensor_uniform(t);
             }
         }
@@ -5345,15 +5360,20 @@ struct test_add_rms_norm_fwht : public test_case {
 // RMS_NORM -> MUL(weight), then unrelated nodes and a second reader of the normalized row, then MUL(signs) -> RESHAPE ->
 // Hadamard MUL_MAT: the attention input at the start of a Bonsai 2 layer (conv-state reads and ssm_alpha/ssm_beta in
 // between). The CUDA backend computes the norm and the transform in one launch at the norm's position.
+// type_mm as in test_add_rms_norm_fwht (qkv and the attention gate).
 struct test_rms_norm_fwht_lookahead : public test_case {
     const int64_t n;
     const int64_t n_tokens;
+    const ggml_type type_mm;
 
-    test_rms_norm_fwht_lookahead(int64_t n = 4096, int64_t n_tokens = 1) : n(n), n_tokens(n_tokens) {}
+    test_rms_norm_fwht_lookahead(int64_t n = 4096, int64_t n_tokens = 1, ggml_type type_mm = GGML_TYPE_COUNT)
+        : n(n), n_tokens(n_tokens), type_mm(type_mm) {}
 
     std::string vars() override {
-        return VARS_TO_STR2(n, n_tokens);
+        return type_mm == GGML_TYPE_COUNT ? VARS_TO_STR2(n, n_tokens) : VARS_TO_STR3(n, n_tokens, type_mm);
     }
+
+    double max_nmse_err() override { return type_mm == GGML_TYPE_COUNT ? 1e-7 : 5e-4; }
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -5384,7 +5404,16 @@ struct test_rms_norm_fwht_lookahead : public test_case {
         ggml_tensor * mm = ggml_mul_mat(ctx, h, cur);
         ggml_mul_mat_set_hint(mm, GGML_HINT_SRC0_IS_HADAMARD);
         // the first operand's subtree comes first in node order, so `other` lands between the norm and the transform
-        ggml_tensor * out = ggml_concat(ctx, other, mm, 0);
+        ggml_tensor * out;
+        if (type_mm == GGML_TYPE_COUNT) {
+            out = ggml_concat(ctx, other, mm, 0);
+        } else {
+            ggml_tensor * wq = ggml_new_tensor_2d(ctx, type_mm, n, 192);
+            ggml_set_name(wq, "w_qkv");
+            ggml_tensor * wz = ggml_new_tensor_2d(ctx, type_mm, n, 64);
+            ggml_set_name(wz, "w_z");
+            out = ggml_concat(ctx, other, ggml_concat(ctx, ggml_mul_mat(ctx, wq, mm), ggml_mul_mat(ctx, wz, mm), 0), 0);
+        }
         ggml_set_name(out, "out");
         return out;
     }
@@ -5411,7 +5440,7 @@ struct test_rms_norm_fwht_lookahead : public test_case {
                     data[i] = (i % 3 == 0) ? -1.0f : 1.0f;
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
-            } else if (t->type == GGML_TYPE_F32) {
+            } else {
                 init_tensor_uniform(t);
             }
         }
@@ -10306,6 +10335,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t n : {1024, 4096}) {
         for (int64_t n_tokens : {1, 4, 8, 33}) {
             test_cases.emplace_back(new test_rms_norm_fwht_lookahead(n, n_tokens));
+        }
+    }
+    // the same with PQ2_0 consumers: q8_1 quantized in the fused kernel (1 column: AoS, 3-8 columns: PQ2 layout)
+    for (int64_t n : {1024, 4096}) {
+        for (int64_t n_tokens : {1, 2, 4, 8, 9}) {
+            test_cases.emplace_back(new test_add_rms_norm_fwht(n, n_tokens, GGML_TYPE_PQ2_0));
+            test_cases.emplace_back(new test_rms_norm_fwht_lookahead(n, n_tokens, GGML_TYPE_PQ2_0));
         }
     }
     test_cases.emplace_back(new test_fwht_signed(1024, 5120, 32));

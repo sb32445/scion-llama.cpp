@@ -2874,6 +2874,87 @@ static bool ggml_cuda_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm
     return true;
 }
 
+// Every use of the Hadamard transform output at node i_mm (directly or through a reshape view of the whole
+// tensor) must be src1 of a PTQ1_0 (or, with accept_pq2, PQ2_0) MUL_MAT that ggml_cuda_mul_mat routes to
+// ggml_cuda_mul_mat_vec_q, all consumers of one weight type so they share one q8_1 layout. The consumers'
+// src1 shape [K, ncols] is what gets quantized. Fills u (the output and its views, K, ncols, weight type).
+struct ggml_cuda_fwht_q8_uses {
+    const ggml_tensor * aliases[8] = {};
+    int       n_aliases = 0;
+    int64_t   K         = 0;
+    int64_t   ncols     = 0;
+    ggml_type wtype     = GGML_TYPE_COUNT;
+};
+
+static bool ggml_cuda_fwht_q8_find_uses(const ggml_cgraph * cgraph, const int i_mm, const int cc, const bool accept_pq2,
+                                        ggml_cuda_fwht_q8_uses & u) {
+    const ggml_tensor * mm = cgraph->nodes[i_mm];
+    const ggml_tensor ** aliases = u.aliases;
+    int &     n_aliases = u.n_aliases;
+    int64_t & K         = u.K;
+    int64_t & ncols     = u.ncols;
+    ggml_type & wtype   = u.wtype;
+    aliases[0] = mm;
+    n_aliases  = 1;
+    int uses_expected = ggml_node_get_use_count(cgraph, i_mm);
+    int uses_found    = 0;
+    for (int j = i_mm + 1; j < cgraph->n_nodes; ++j) {
+        ggml_tensor * t = cgraph->nodes[j];
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            const ggml_tensor * src = t->src[s];
+            if (!src) {
+                continue;
+            }
+            bool is_alias = false;
+            for (int a = 0; a < n_aliases; ++a) {
+                if (src == aliases[a]) {
+                    is_alias = true;
+                    break;
+                }
+            }
+            if (!is_alias) {
+                continue;
+            }
+            uses_found++;
+            if (t->op == GGML_OP_RESHAPE && t->view_src == mm && t->data == mm->data &&
+                    ggml_nelements(t) == ggml_nelements(mm) && ggml_is_contiguous(t)) {
+                if (n_aliases == 8) {
+                    return false;
+                }
+                aliases[n_aliases++] = t;
+                uses_expected += ggml_node_get_use_count(cgraph, j);
+                continue;
+            }
+            const ggml_type ct = t->src[0] ? t->src[0]->type : GGML_TYPE_COUNT;
+            const bool type_ok = ct == GGML_TYPE_PTQ1_0 || (accept_pq2 && ct == GGML_TYPE_PQ2_0);
+            if (t->op != GGML_OP_MUL_MAT || s != 1 || !type_ok || (wtype != GGML_TYPE_COUNT && ct != wtype) ||
+                    ggml_get_op_params_i32(t, 1) == GGML_HINT_SRC0_IS_HADAMARD ||
+                    t->type != GGML_TYPE_F32 || src->type != GGML_TYPE_F32 || !ggml_is_contiguous(src) ||
+                    src->ne[2] != 1 || src->ne[3] != 1 ||
+                    (K != 0 && (src->ne[0] != K || src->ne[1] != ncols)) ||
+                    !ggml_cuda_should_use_mmvq(ct, cc, src->ne[1])) {
+                return false;
+            }
+            if (ct == GGML_TYPE_PQ2_0 && cc >= GGML_CUDA_CC_PASCAL && cc < GGML_CUDA_CC_VOLTA) {
+                return false; // ggml_cuda_mul_mat_pq2_0_ordered quantizes src1 itself
+            }
+            K     = src->ne[0];
+            ncols = src->ne[1];
+            wtype = ct;
+            // ggml_cuda_mul_mat sends a padded compute-buffer view to cuBLAS instead
+            const ggml_tensor * w = t->src[0];
+            if (ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+                    ggml_nbytes(w) != ggml_backend_buffer_get_alloc_size(w->buffer, w) && w->view_src) {
+                return false;
+            }
+        }
+    }
+    if (uses_found == 0 || uses_found != uses_expected || K == 0) {
+        return false;
+    }
+    return true;
+}
+
 // A Hadamard rotation of an activation ([MUL signs, RESHAPE,] MUL_MAT with GGML_HINT_SRC0_IS_HADAMARD)
 // whose every use is a PTQ1_0 mat-vec on the mmvq path does not need to exist in F32: each of those
 // mat-vecs quantizes it to q8_1 straight away, so the transform kernel quantizes as it goes and writes
@@ -2955,74 +3036,17 @@ static int ggml_cuda_try_fwht_q8(ggml_backend_cuda_context & ctx, const ggml_cgr
     };
     const bool out_aliases_in = overlaps(x, mm) || (signs && overlaps(signs, mm));
 
-    // every use of the transform output (directly or through a reshape view of the whole tensor)
-    // must be src1 of a PTQ1_0 (or, opted in, PQ2_0) MUL_MAT that ggml_cuda_mul_mat routes to
-    // ggml_cuda_mul_mat_vec_q, all consumers of one weight type so they share one q8_1 layout.
-    // The consumers' src1 shape [K, ncols] is what gets quantized (x is only known to be
-    // contiguous with the same element count; in the unsigned pattern it is the [n, rows] reshape).
-    const ggml_tensor * aliases[8] = { mm };
-    int     n_aliases     = 1;
-    int     uses_expected = ggml_node_get_use_count(cgraph, i_mm);
-    int     uses_found    = 0;
-    int64_t K             = 0;
-    int64_t ncols         = 0;
-    int64_t ne0_padded    = 0;
-    ggml_type wtype       = GGML_TYPE_COUNT;
-    ggml_cuda_q8_1_layout layout = GGML_CUDA_Q8_1_AOS;
-    for (int j = i_mm + 1; j < cgraph->n_nodes; ++j) {
-        ggml_tensor * t = cgraph->nodes[j];
-        for (int s = 0; s < GGML_MAX_SRC; ++s) {
-            const ggml_tensor * src = t->src[s];
-            if (!src) {
-                continue;
-            }
-            bool is_alias = false;
-            for (int a = 0; a < n_aliases; ++a) {
-                if (src == aliases[a]) {
-                    is_alias = true;
-                    break;
-                }
-            }
-            if (!is_alias) {
-                continue;
-            }
-            uses_found++;
-            if (t->op == GGML_OP_RESHAPE && t->view_src == mm && t->data == mm->data &&
-                    ggml_nelements(t) == ggml_nelements(mm) && ggml_is_contiguous(t)) {
-                if (n_aliases == 8) {
-                    return 0;
-                }
-                aliases[n_aliases++] = t;
-                uses_expected += ggml_node_get_use_count(cgraph, j);
-                continue;
-            }
-            const ggml_type ct = t->src[0] ? t->src[0]->type : GGML_TYPE_COUNT;
-            const bool type_ok = ct == GGML_TYPE_PTQ1_0 || (pq2_enabled && ct == GGML_TYPE_PQ2_0);
-            if (t->op != GGML_OP_MUL_MAT || s != 1 || !type_ok || (wtype != GGML_TYPE_COUNT && ct != wtype) ||
-                    ggml_get_op_params_i32(t, 1) == GGML_HINT_SRC0_IS_HADAMARD ||
-                    t->type != GGML_TYPE_F32 || src->type != GGML_TYPE_F32 || !ggml_is_contiguous(src) ||
-                    src->ne[2] != 1 || src->ne[3] != 1 ||
-                    (K != 0 && (src->ne[0] != K || src->ne[1] != ncols)) ||
-                    !ggml_cuda_should_use_mmvq(ct, cc, src->ne[1])) {
-                return 0;
-            }
-            if (ct == GGML_TYPE_PQ2_0 && cc >= GGML_CUDA_CC_PASCAL && cc < GGML_CUDA_CC_VOLTA) {
-                return 0; // ggml_cuda_mul_mat_pq2_0_ordered quantizes src1 itself
-            }
-            K     = src->ne[0];
-            ncols = src->ne[1];
-            wtype = ct;
-            // ggml_cuda_mul_mat sends a padded compute-buffer view to cuBLAS instead
-            const ggml_tensor * w = t->src[0];
-            if (ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
-                    ggml_nbytes(w) != ggml_backend_buffer_get_alloc_size(w->buffer, w) && w->view_src) {
-                return 0;
-            }
-        }
-    }
-    if (uses_found == 0 || uses_found != uses_expected || K == 0) {
+    // x is only known to be contiguous with the same element count as the consumers' src1 [K, ncols];
+    // in the unsigned pattern it is the [n, rows] reshape
+    ggml_cuda_fwht_q8_uses u;
+    if (!ggml_cuda_fwht_q8_find_uses(cgraph, i_mm, cc, pq2_enabled, u)) {
         return 0;
     }
+    const int64_t K     = u.K;
+    const int64_t ncols = u.ncols;
+    const ggml_type wtype = u.wtype;
+    int64_t ne0_padded = 0;
+    ggml_cuda_q8_1_layout layout = GGML_CUDA_Q8_1_AOS;
     if (K % n != 0 || !ggml_cuda_fwht_quantize_supported(n, K) || (signs && signs->ne[0] != K)) {
         return 0;
     }
@@ -3060,8 +3084,8 @@ static int ggml_cuda_try_fwht_q8(ggml_backend_cuda_context & ctx, const ggml_cgr
     e.ne0    = ne0_padded;
     e.ncols  = ncols;
     e.data   = out;
-    for (int a = 0; a < n_aliases; ++a) {
-        ctx.fwht_q8().set(aliases[a], e);
+    for (int a = 0; a < u.n_aliases; ++a) {
+        ctx.fwht_q8().set(u.aliases[a], e);
     }
     return consumed;
 }
@@ -4296,6 +4320,47 @@ static bool ggml_cuda_hadamard_feeds_ptq1(const ggml_cgraph * cgraph, int i_mm) 
     return false;
 }
 
+// The norm + transform fusions below can also quantize the transformed rows when every use of the transform output
+// (node i_mm, width n) is a PQ2_0 mat-vec on the mmvq path over the full row, with a q8_1 layout the fused kernel
+// writes: AOS (1 column) or PQ2 (the multi-column path). The mat-vecs then find the rows through ctx.fwht_q8() and
+// skip their quantize launch. GGML_CUDA_NORM_FWHT_Q8=0 disables it.
+struct ggml_cuda_norm_fwht_q8_plan {
+    ggml_cuda_fwht_q8_uses uses;
+    ggml_cuda_q8_1_layout  layout = GGML_CUDA_Q8_1_AOS;
+};
+
+static bool ggml_cuda_norm_fwht_q8_prepare(const ggml_cgraph * cgraph, const int i_mm, const int64_t n,
+                                           ggml_cuda_norm_fwht_q8_plan & plan) {
+    static const bool disabled = getenv("GGML_CUDA_NORM_FWHT_Q8") != nullptr && atoi(getenv("GGML_CUDA_NORM_FWHT_Q8")) == 0;
+    if (disabled) {
+        return false;
+    }
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_TURING) {
+        return false;
+    }
+    const ggml_tensor * mm = cgraph->nodes[i_mm];
+    ggml_cuda_fwht_q8_uses & u = plan.uses;
+    if (!ggml_cuda_fwht_q8_find_uses(cgraph, i_mm, cc, true, u) || u.wtype != GGML_TYPE_PQ2_0 || u.K != n ||
+            u.K * u.ncols != ggml_nelements(mm) || GGML_PAD(u.K, MATRIX_ROW_PADDING) != u.K) {
+        return false;
+    }
+    plan.layout = ggml_cuda_q8_1_layout_host(u.wtype, (int) u.ncols, false);
+    return plan.layout == GGML_CUDA_Q8_1_AOS || plan.layout == GGML_CUDA_Q8_1_PQ2;
+}
+
+static void ggml_cuda_norm_fwht_q8_register(ggml_backend_cuda_context & ctx, const ggml_tensor * mm,
+                                            const ggml_cuda_norm_fwht_q8_plan & plan) {
+    ggml_cuda_fwht_q8 e;
+    e.layout = plan.layout;
+    e.ne0    = plan.uses.K;
+    e.ncols  = plan.uses.ncols;
+    e.data   = mm->data;
+    for (int a = 0; a < plan.uses.n_aliases; ++a) {
+        ctx.fwht_q8().set(plan.uses.aliases[a], e);
+    }
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -4427,7 +4492,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     weight->data != mm->data && signs->data != mm->data &&
                     ggml_can_fuse_subgraph(cgraph, i, 6, ops, out_nodes, 2) &&
                     ggml_cuda_check_fusion_memory_ranges(cgraph, i, 6, out_nodes, 2, false, true)) {
-                ggml_cuda_op_add_rms_norm_fwht_fused(*cuda_ctx, node, rms_norm, weight, signs, nullptr, mm);
+                ggml_cuda_norm_fwht_q8_plan plan;
+                if (ggml_cuda_norm_fwht_q8_prepare(cgraph, i + 5, ncols, plan)) {
+                    ggml_cuda_op_add_rms_norm_fwht_fused(*cuda_ctx, node, rms_norm, weight, signs, nullptr, mm, mm->data, plan.layout);
+                    ggml_cuda_norm_fwht_q8_register(*cuda_ctx, mm, plan);
+                } else {
+                    ggml_cuda_op_add_rms_norm_fwht_fused(*cuda_ctx, node, rms_norm, weight, signs, nullptr, mm);
+                }
                 return 5;
             }
         }
@@ -4508,7 +4579,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 }
             }
             if (ok) {
-                ggml_cuda_op_add_rms_norm_fwht_fused(*cuda_ctx, nullptr, node, weight, signs, mul_w, mm);
+                ggml_cuda_norm_fwht_q8_plan plan;
+                if (ggml_cuda_norm_fwht_q8_prepare(cgraph, j + 2, ncols, plan)) {
+                    ggml_cuda_op_add_rms_norm_fwht_fused(*cuda_ctx, nullptr, node, weight, signs, mul_w, mm, mm->data, plan.layout);
+                    ggml_cuda_norm_fwht_q8_register(*cuda_ctx, mm, plan);
+                } else {
+                    ggml_cuda_op_add_rms_norm_fwht_fused(*cuda_ctx, nullptr, node, weight, signs, mul_w, mm);
+                }
                 auto & pre = cuda_ctx->fwht_q8().precomputed;
                 pre.insert(mul_s);
                 pre.insert(reshape);
