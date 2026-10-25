@@ -1639,6 +1639,34 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        // without events (no pipeline parallelism), the split backend is waited for once per split: the input copies only
+        // add work for this split. The inputs in host memory are uploaded with async copies, all waited for once before the
+        // split is computed, instead of one blocking copy each.
+        const bool split_events = sched->events[split_backend_id][sched->cur_copy] != NULL;
+        const bool upload_async = !split_events && split_backend->iface.set_tensor_async != NULL && !ggml_backend_is_meta(split_backend);
+        bool split_backend_synced = false;
+        int  n_uploads            = 0;
+
+        auto sync_split_backend = [&]() {
+            if (!split_backend_synced) {
+                ggml_backend_synchronize(split_backend);
+                split_backend_synced = true;
+            }
+        };
+
+        // returns false if the copy has to be made with ggml_backend_tensor_copy
+        auto upload_host_input = [&](ggml_tensor * input, ggml_tensor * input_cpy) {
+            if (!upload_async || !ggml_backend_buffer_is_host(input->buffer) || !ggml_is_contiguous(input) || input_cpy->buffer == NULL ||
+                ggml_backend_buffer_get_type(input_cpy->buffer) != ggml_backend_get_default_buffer_type(split_backend)) {
+                return false;
+            }
+            GGML_ASSERT(ggml_are_same_layout(input, input_cpy) && "cannot copy tensors with different layouts");
+            sync_split_backend();
+            ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+            n_uploads++;
+            return true;
+        };
+
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
@@ -1652,19 +1680,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
-                // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
-                if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                // inputs from the user must be copied before returning to prevent the user overwriting the data before the copy is done
+                if (split_events) {
                     ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
-                } else {
-                    ggml_backend_synchronize(split_backend);
+                    ggml_backend_tensor_copy(input, input_cpy);
+                } else if (!upload_host_input(input, input_cpy)) {
+                    sync_split_backend();
+                    ggml_backend_tensor_copy(input, input_cpy);
                 }
-                ggml_backend_tensor_copy(input, input_cpy);
             } else {
                 // wait for the split backend to finish using the input before overwriting it
-                if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                if (split_events) {
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
                 } else {
-                    ggml_backend_synchronize(split_backend);
+                    sync_split_backend();
                 }
 
                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
@@ -1757,15 +1786,25 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
                     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
                         ggml_backend_synchronize(input_backend);
-                        if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                        if (split_events) {
                             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
-                        } else {
-                            ggml_backend_synchronize(split_backend);
+                            ggml_backend_tensor_copy(input, input_cpy);
+                        } else if (!upload_host_input(input, input_cpy)) {
+                            sync_split_backend();
+                            ggml_backend_tensor_copy(input, input_cpy);
                         }
-                        ggml_backend_tensor_copy(input, input_cpy);
                     }
                 }
             }
+        }
+
+        if (n_uploads > 0) {
+            // the host data of the uploads can be overwritten once this function returns (inputs from the user) or once
+            // a later split computes (computed inputs): wait for the copies, as the blocking copies did
+            if (ggml_sync_trace_on()) {
+                ggml_sync_trace_set_cause("sched: split input uploads");
+            }
+            ggml_backend_synchronize(split_backend);
         }
 
         if (ggml_sync_trace_on()) {

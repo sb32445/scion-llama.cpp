@@ -5331,11 +5331,14 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     // scratch pool is stack-like, so all releases happen globally in reverse.
     std::vector<std::unique_ptr<ggml_cuda_pool_alloc<char>>> gb10_pool_allocations;
 
+    // only read while the nodes are evaluated or captured: not built when a captured CUDA graph is replayed
     std::map<const ggml_tensor *, std::array<int, GGML_TYPE_COUNT>> gb10_shared_q8_consumer_counts;
-    for (int j = 0; j < cgraph->n_nodes; ++j) {
-        const ggml_tensor * candidate = cgraph->nodes[j];
-        if (candidate->op == GGML_OP_MUL_MAT && candidate->src[0] && candidate->src[1]) {
-            ++gb10_shared_q8_consumer_counts[candidate->src[1]][candidate->src[0]->type];
+    if (!use_cuda_graph || cuda_graph_update_required) {
+        for (int j = 0; j < cgraph->n_nodes; ++j) {
+            const ggml_tensor * candidate = cgraph->nodes[j];
+            if (candidate->op == GGML_OP_MUL_MAT && candidate->src[0] && candidate->src[1]) {
+                ++gb10_shared_q8_consumer_counts[candidate->src[1]][candidate->src[0]->type];
+            }
         }
     }
     const auto gb10_shared_q8_consumer_count = [&](const ggml_tensor * src1, ggml_type type) {
@@ -5743,7 +5746,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
     if (graph->is_enabled()) {
-        const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
+        // graph->uid is only set for a compatible graph (ggml_cuda_graph_update_required), and an unchanged uid means
+        // the same nodes: skip the scan of the nodes
+        const bool graph_compatible = (cgraph->uid != 0 && cgraph->uid == graph->uid) || ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 
