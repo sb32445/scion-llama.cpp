@@ -11428,6 +11428,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             false, 1, 1, false, false, true, false, {1, 1}));
     }
 
+    // PTQ1_0 one-column K-block-stationary mat-vec (CUDA, Hopper): at least 4096 rows with a row tail,
+    // K = 40, 48 and 136 blocks, plain and with bias / gate / gate + bias fusion
+    for (int64_t k : {5120, 6144, 17408}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 4100, 1, k, {1, 1}, {1, 1}));
+        for (bool with_gate : {false, true}) {
+            for (bool with_bias : {false, true}) {
+                test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_PTQ1_0, GGML_GLU_OP_SWIGLU, 1, 4100, k,
+                    false, 1, 1, false, with_bias, with_gate, false, {1, 1}));
+            }
+        }
+    }
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_PTQ1_0, GGML_GLU_OP_GEGLU, 1, 4100, 5120,
+        false, 1, 1, false, false, true, false, {1, 1}));
+
     // ARC-LAB: the MTP draft head's Q6_K weights at their shapes, 1..6 tokens (draft steps, chain step 0): the mat-vecs
     // (GGML_SYCL_Q6K_GEMV / _U / _SG) and the FFN gate+up+SWIGLU (GGML_SYCL_Q6K_GLU=1 takes the fused kernel)
     for (int n : {1, 2, 6}) {
