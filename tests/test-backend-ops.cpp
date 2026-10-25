@@ -11482,6 +11482,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // PQ2_0 gate/up + GLU and bias fusion at 9B-like widths, 1-8 tokens (multi-column kernel epilogue)
+    for (int64_t m_batch : {1, 2, 4, 8}) {
+        for (bool with_bias : {false, true}) {
+            for (bool with_gate : {false, true}) {
+                test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_PQ2_0, GGML_GLU_OP_SWIGLU, m_batch, 256, 4096,
+                    false, 1, 1, false, with_bias, with_gate, false, {1, 1}));
+            }
+        }
+    }
+
     // PTQ1_0 dedicated mat-vec, shared-memory boundary on this branch. The launch asks for
     // ncols * rows_per_cta * (K/128 + 1) * 4 bytes (the +1 is the odd epilogue stride), twice
     // that with a gate, against the 48 KiB default. One column and 4 rows per CTA: last K that
@@ -11742,6 +11752,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // PQ2_0 at 1 column, Bonsai 2 9B decode shapes
+    for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{1024, 4096}, {2048, 4096}, {4096, 4096}, {6144, 4096}, {8192, 4096}, {12288, 4096}, {4096, 12288}, {24576, 4096}, {248320, 4096}}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PQ2_0, GGML_TYPE_F32, m, 1, k, {1, 1}, {1, 1}));
+    }
     // PQ2_0 at speculative verify widths, at the 27B projection shapes and the vocab head
     for (int n : {1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 16, 17, 24, 32}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PQ2_0, GGML_TYPE_F32, 17408, n, 5120, {1, 1}, {1, 1}));

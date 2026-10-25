@@ -1292,6 +1292,18 @@ int ggml_cuda_get_device();
 // Lives here, after ggml_cuda_info(), because the body reads the current device's cc.
 // PQ2_0 multi-column mat-vec (mmvq-pq2_0.cuh): Ada and Hopper, plain 2D (no ids, no batch dims), 3-8 columns.
 // Batch invariance keeps the generic kernel.
+// Smallest column count sent to the PQ2_0 multi-column kernel. On Hopper that includes the 1- and 2-column mat-vecs of
+// plain decode (with the bias / gate+GLU fusion in its epilogue): it needs no per-weight decode and reaches 2.3-2.9 TB/s
+// on the larger projections where the generic tall-row path stops at 1.7-2.2. Elsewhere it starts at 3 columns (not
+// measured below that). GGML_CUDA_PQ2_MC_MIN overrides it.
+static inline int ggml_cuda_pq2_mc_min(int cc) {
+    static const int env = getenv("GGML_CUDA_PQ2_MC_MIN") ? atoi(getenv("GGML_CUDA_PQ2_MC_MIN")) : 0;
+    if (env > 0) {
+        return env;
+    }
+    return cc == GGML_CUDA_CC_HOPPER ? 1 : 3;
+}
+
 static inline bool ggml_cuda_pq2_multicol(int ncols_dst) {
 #if defined(GGML_USE_HIP)
     GGML_UNUSED(ncols_dst);
@@ -1299,7 +1311,7 @@ static inline bool ggml_cuda_pq2_multicol(int ncols_dst) {
 #else
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     return !ggml_cuda_batch_invariant() && GGML_CUDA_CC_IS_NVIDIA(cc) &&
-        (cc == GGML_CUDA_CC_ADA_LOVELACE || cc == GGML_CUDA_CC_HOPPER) && ncols_dst >= 3 && ncols_dst <= 8;
+        (cc == GGML_CUDA_CC_ADA_LOVELACE || cc == GGML_CUDA_CC_HOPPER) && ncols_dst >= ggml_cuda_pq2_mc_min(cc) && ncols_dst <= 8;
 #endif
 }
 
