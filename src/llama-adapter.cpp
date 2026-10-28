@@ -484,82 +484,103 @@ static void llama_adapter_lora_init_impl(llama_model & model, const char * path_
         }
     }
 
-    // fold the router corrections into F32 copies of the router weights: one mat-vec instead of three per layer
-    if (embedded && !adapter.rotated_basis && getenv("LLAMA_NO_FOLD_ROUTER") == nullptr) {
-        std::vector<std::pair<llama_adapter_lora_weight *, const ggml_tensor *>> todo;
+    // Fold b*a into a copy of the base weight at load, so build_lora_mm runs one mat-vec instead of three plus an add.
+    // Router (F32 base, F16 branch): exact in F32. Body weights (Q8_0 base, quantized branch), opt-in: the sum is
+    // quantized to Q8_0 again and needs one more copy of the weight in VRAM.
+    auto fold_group = [&](const char * what, ggml_type ftype, const std::vector<std::pair<llama_adapter_lora_weight *, const ggml_tensor *>> & todo) {
+        if (todo.empty()) {
+            return;
+        }
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(todo[0].second->buffer);
+        ggml_init_params params = { /*.mem_size =*/ todo.size()*ggml_tensor_overhead(), /*.mem_buffer =*/ NULL, /*.no_alloc =*/ true };
+        ggml_context * fctx = ggml_init(params);
+        adapter.ctxs.emplace_back(fctx);
+        for (auto & td : todo) {
+            td.first->folded = ggml_new_tensor_2d(fctx, ftype, td.second->ne[0], td.second->ne[1]);
+            ggml_set_name(td.first->folded, td.second->name);
+        }
+        ggml_backend_buffer_ptr fbuf { ggml_backend_alloc_ctx_tensors_from_buft(fctx, buft) };
+        if (!fbuf) {
+            for (auto & td : todo) {
+                td.first->folded = nullptr;
+            }
+            return;
+        }
+        LLAMA_LOG_INFO("%s: folded %s LoRA into %zu weights, %8.2f MiB\n", __func__, what, todo.size(), ggml_backend_buffer_get_size(fbuf.get())/1024.0/1024.0);
+        adapter.bufs.emplace_back(std::move(fbuf));
+        auto to_f32 = [](const ggml_tensor * t) {
+            std::vector<float> v(ggml_nelements(t));
+            if (t->type == GGML_TYPE_F32) {
+                ggml_backend_tensor_get(t, v.data(), 0, ggml_nbytes(t));
+            } else {
+                std::vector<char> raw(ggml_nbytes(t));
+                ggml_backend_tensor_get(t, raw.data(), 0, raw.size());
+                ggml_get_type_traits(t->type)->to_float(raw.data(), v.data(), (int64_t) v.size());
+            }
+            return v;
+        };
+        for (auto & td : todo) {
+            const ggml_tensor * base = td.second;
+            llama_adapter_lora_weight & w = *td.first;
+            if (base->data == nullptr || w.a->data == nullptr || w.b->data == nullptr) {
+                continue; // dry run (memory fit): tensors have no data
+            }
+            const int64_t K = base->ne[0], N = base->ne[1], R = w.a->ne[1];
+            std::vector<float> out = to_f32(base);
+            const std::vector<float> A = to_f32(w.a); // [R][K]
+            const std::vector<float> B = to_f32(w.b); // [N][R]
+            const int nt = (int) std::max(1u, std::min(12u, std::thread::hardware_concurrency()));
+            std::vector<std::thread> ths;
+            for (int ti = 0; ti < nt; ++ti) {
+                ths.emplace_back([&, ti]() {
+                    for (int64_t n = ti; n < N; n += nt) {
+                        float * o = out.data() + n*K;
+                        for (int64_t r = 0; r < R; ++r) {
+                            const float cf = B[n*R + r];
+                            const float * a = A.data() + r*K;
+                            for (int64_t k = 0; k < K; ++k) {
+                                o[k] += cf*a[k];
+                            }
+                        }
+                    }
+                });
+            }
+            for (auto & th : ths) {
+                th.join();
+            }
+            if (ftype == GGML_TYPE_F32) {
+                ggml_backend_tensor_set(w.folded, out.data(), 0, ggml_nbytes(w.folded));
+            } else {
+                std::vector<char> q(ggml_nbytes(w.folded));
+                ggml_get_type_traits(ftype)->from_float_ref(out.data(), q.data(), (int64_t) out.size());
+                ggml_backend_tensor_set(w.folded, q.data(), 0, q.size());
+            }
+        }
+    };
+
+    if (embedded && !adapter.rotated_basis) {
+        std::vector<std::pair<llama_adapter_lora_weight *, const ggml_tensor *>> router, body;
+        const bool want_router = getenv("LLAMA_NO_FOLD_ROUTER") == nullptr;
+        const bool want_body   = getenv("LLAMA_FOLD_BODY") != nullptr;
         for (auto & it : adapter.ab_map) {
-            if (!taardis_ends_with(it.first, ".ffn_gate_inp.weight")) {
+            llama_adapter_lora_weight & w = it.second;
+            if (taardis_virtual_target(it.first) || w.get_scale(adapter.alpha, 1.0f) != 1.0f) {
                 continue;
             }
             const ggml_tensor * base = model.get_tensor(it.first.c_str());
-            llama_adapter_lora_weight & w = it.second;
-            if (base && base->type == GGML_TYPE_F32 && ggml_n_dims(base) == 2 &&
-                    (w.a->type == GGML_TYPE_F16 || w.a->type == GGML_TYPE_F32) &&
-                    (w.b->type == GGML_TYPE_F16 || w.b->type == GGML_TYPE_F32) && w.get_scale(adapter.alpha, 1.0f) == 1.0f) {
-                todo.emplace_back(&w, base);
+            if (!base || ggml_n_dims(base) != 2) {
+                continue;
+            }
+            const bool f_ab = (w.a->type == GGML_TYPE_F16 || w.a->type == GGML_TYPE_F32) && (w.b->type == GGML_TYPE_F16 || w.b->type == GGML_TYPE_F32);
+            if (want_router && taardis_ends_with(it.first, ".ffn_gate_inp.weight") && base->type == GGML_TYPE_F32 && f_ab) {
+                router.emplace_back(&w, base);
+            } else if (want_body && base->type == GGML_TYPE_Q8_0 && w.a->type == GGML_TYPE_PQ2_0 && w.b->type == GGML_TYPE_PQ2_0 &&
+                    (taardis_ends_with(it.first, ".ssm_out.weight") || taardis_ends_with(it.first, ".attn_output.weight"))) {
+                body.emplace_back(&w, base);
             }
         }
-        if (!todo.empty()) {
-            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(todo[0].second->buffer);
-            ggml_init_params params = { /*.mem_size =*/ todo.size()*ggml_tensor_overhead(), /*.mem_buffer =*/ NULL, /*.no_alloc =*/ true };
-            ggml_context * fctx = ggml_init(params);
-            adapter.ctxs.emplace_back(fctx);
-            for (auto & td : todo) {
-                td.first->folded = ggml_new_tensor_2d(fctx, GGML_TYPE_F32, td.second->ne[0], td.second->ne[1]);
-                ggml_set_name(td.first->folded, td.second->name);
-            }
-            ggml_backend_buffer_ptr fbuf { ggml_backend_alloc_ctx_tensors_from_buft(fctx, buft) };
-            if (fbuf) {
-                LLAMA_LOG_INFO("%s: folded router LoRA into %zu F32 weights, %8.2f MiB\n", __func__, todo.size(), ggml_backend_buffer_get_size(fbuf.get())/1024.0/1024.0);
-                adapter.bufs.emplace_back(std::move(fbuf));
-                auto to_f32 = [](const ggml_tensor * t) {
-                    std::vector<float> v(ggml_nelements(t));
-                    if (t->type == GGML_TYPE_F32) {
-                        ggml_backend_tensor_get(t, v.data(), 0, ggml_nbytes(t));
-                    } else {
-                        std::vector<ggml_fp16_t> h(v.size());
-                        ggml_backend_tensor_get(t, h.data(), 0, ggml_nbytes(t));
-                        ggml_fp16_to_fp32_row(h.data(), v.data(), (int64_t) v.size());
-                    }
-                    return v;
-                };
-                for (auto & td : todo) {
-                    const ggml_tensor * base = td.second;
-                    llama_adapter_lora_weight & w = *td.first;
-                    if (base->data == nullptr || w.a->data == nullptr || w.b->data == nullptr) {
-                        continue; // dry run (memory fit): tensors have no data
-                    }
-                    const int64_t K = base->ne[0], N = base->ne[1], R = w.a->ne[1];
-                    std::vector<float> out = to_f32(base);
-                    const std::vector<float> A = to_f32(w.a); // [R][K]
-                    const std::vector<float> B = to_f32(w.b); // [N][R]
-                    const int nt = (int) std::max(1u, std::min(8u, std::thread::hardware_concurrency()));
-                    std::vector<std::thread> ths;
-                    for (int ti = 0; ti < nt; ++ti) {
-                        ths.emplace_back([&, ti]() {
-                            for (int64_t n = ti; n < N; n += nt) {
-                                float * o = out.data() + n*K;
-                                for (int64_t r = 0; r < R; ++r) {
-                                    const float cf = B[n*R + r];
-                                    const float * a = A.data() + r*K;
-                                    for (int64_t k = 0; k < K; ++k) {
-                                        o[k] += cf*a[k];
-                                    }
-                                }
-                            }
-                        });
-                    }
-                    for (auto & th : ths) {
-                        th.join();
-                    }
-                    ggml_backend_tensor_set(w.folded, out.data(), 0, ggml_nbytes(w.folded));
-                }
-            } else {
-                for (auto & td : todo) {
-                    td.first->folded = nullptr;
-                }
-            }
-        }
+        fold_group("router", GGML_TYPE_F32, router);
+        fold_group("body", GGML_TYPE_Q8_0, body);
     }
 
     // register adapter with model
