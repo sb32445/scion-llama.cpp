@@ -1625,7 +1625,18 @@ ggml_tensor * llm_graph_context::build_lora_mm(
         }
     }
 
-    ggml_tensor * res = ggml_mul_mat(ctx0, w, cur_mm);
+    // router corrections folded into the weight at load: use the folded weight at scale 1.0 and skip the branch
+    const llama_adapter_lora_weight * folded_lw = nullptr;
+    ggml_tensor * w_eff = w;
+    for (const auto & lora : *loras) {
+        llama_adapter_lora_weight * lw = lora.first->get_weight(w);
+        if (lw && lw->folded && lora.second == 1.0f && folded_lw == nullptr) {
+            folded_lw = lw;
+            w_eff     = lw->folded;
+        }
+    }
+
+    ggml_tensor * res = ggml_mul_mat(ctx0, w_eff, cur_mm);
 
     if (w_s) {
         res = ggml_mul(ctx0, res, w_s);
@@ -1633,7 +1644,7 @@ ggml_tensor * llm_graph_context::build_lora_mm(
 
     for (const auto & lora : *loras) {
         llama_adapter_lora_weight * lw = lora.first->get_weight(w);
-        if (lw == nullptr) {
+        if (lw == nullptr || lw == folded_lw) {
             continue;
         }
 

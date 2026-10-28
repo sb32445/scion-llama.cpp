@@ -49,6 +49,10 @@ struct llama_adapter_lora_weight {
     ggml_tensor * a = nullptr;
     ggml_tensor * b = nullptr;
 
+    // base weight + scale * b*a, folded at load (F32 router weights); graphs use it at scale 1.0 and skip the branch
+    ggml_tensor * folded = nullptr;
+    float         folded_scale = 1.0f;
+
     // get actual scale based on rank and alpha
     float get_scale(float alpha, float adapter_scale) const {
         const float rank  = (float) b->ne[0];
