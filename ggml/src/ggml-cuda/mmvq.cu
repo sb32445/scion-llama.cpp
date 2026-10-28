@@ -1718,7 +1718,8 @@ void ggml_cuda_mul_mat_vec_q(
         const char * env = getenv("GGML_CUDA_Q8_SHARE");
         return !env || atoi(env) != 0;
     }();
-    const bool shareable = share_q8 && y_layout == GGML_CUDA_Q8_1_AOS && ne11 == 1 && ne12 == 1 && ne13 == 1;
+    // no sharing while branches run on several streams (a reader could run before the writer)
+    const bool shareable = share_q8 && ctx.stream_context().concurrent_events.empty() && y_layout == GGML_CUDA_Q8_1_AOS && ne11 == 1 && ne12 == 1 && ne13 == 1;
     if (pre_q8) {
         const bool match = pre_q8->layout == y_layout && pre_q8->ne0 == ne10_padded && pre_q8->ncols == ne11 && ne12 == 1 && ne13 == 1;
         if (ctx.fwht_q8().in_arena(pre_q8->data) && !match) {
