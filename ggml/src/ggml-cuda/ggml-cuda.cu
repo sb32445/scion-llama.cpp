@@ -29,6 +29,7 @@
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
+#include "ggml-cuda/lora-ab.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
@@ -4375,6 +4376,24 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }();
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    // LoRA branch of an embedded adapter: A and B mat-vec in one launch
+    if (node->op == GGML_OP_MUL_MAT && i + 1 < cgraph->n_nodes) {
+        static const bool fused_lora = [] {
+            const char * env = getenv("GGML_CUDA_FUSED_LORA");
+            return !env || std::atoi(env) != 0;
+        }();
+        ggml_tensor * mm_b = cgraph->nodes[i + 1];
+        if (fused_lora && mm_b->op == GGML_OP_MUL_MAT && mm_b->src[1] == node &&
+                strstr(node->src[0]->name, ".lora_a") && strstr(mm_b->src[0]->name, ".lora_b") &&
+                node->type == GGML_TYPE_F32 && mm_b->type == GGML_TYPE_F32 &&
+                ggml_node_has_n_uses(cgraph, i, 1) && (mm_b->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+                ggml_cuda_lora_ab_supported(node->src[0], mm_b->src[0], node->src[1], ggml_cuda_info().devices[cuda_ctx->device].cc,
+                                            ggml_cuda_info().devices[cuda_ctx->device].nsm)) {
+            ggml_cuda_lora_ab(*cuda_ctx, node->src[0], mm_b->src[0], node->src[1], mm_b);
+            return 1;
+        }
+    }
 
     if (node->op == GGML_OP_CPY) {
         static const bool batched_cpy = [] {
