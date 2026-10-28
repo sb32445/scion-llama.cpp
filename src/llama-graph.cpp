@@ -1647,7 +1647,9 @@ ggml_tensor * llm_graph_context::build_lora_mm(
                 ggml_mul_mat(ctx0, lw->a, lora.first->rotated_basis ? cur_mm : cur)
                 );
 
-        ab_cur = ggml_scale(ctx0, ab_cur, scale);
+        if (scale != 1.0f) {
+            ab_cur = ggml_scale(ctx0, ab_cur, scale);
+        }
         res = ggml_add(ctx0, res, ab_cur);
     }
 
@@ -1673,7 +1675,9 @@ ggml_tensor * llm_graph_context::build_lora_branch(
                 ggml_mul_mat(ctx0, lw->a, cur)
                 );
 
-        ab_cur = ggml_scale(ctx0, ab_cur, scale);
+        if (scale != 1.0f) {
+            ab_cur = ggml_scale(ctx0, ab_cur, scale);
+        }
         res = res ? ggml_add(ctx0, res, ab_cur) : ab_cur;
     }
 
@@ -1739,7 +1743,9 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
                 ids
                 );
 
-        ab_cur = ggml_scale(ctx0, ab_cur, scale);
+        if (scale != 1.0f) {
+            ab_cur = ggml_scale(ctx0, ab_cur, scale);
+        }
         res = ggml_add(ctx0, res, ab_cur);
     }
 
