@@ -299,18 +299,25 @@ std::string common_params_sampling::print() const {
 }
 
 // k > 0 if the sampler chain starts with top-k (every sampler before it does nothing with these settings)
+// penalties that only lower logits add penalty_last_n to k: at most that many distinct tokens are lowered, so the top k
+// after the penalties is inside the top k + penalty_last_n of the raw logits
 static int32_t common_sampler_fast_topk(const common_params_sampling & params, bool has_logit_bias) {
     if (has_logit_bias || params.mirostat != 0 || params.backend_sampling || params.top_k <= 0 || params.top_k > 128) {
         return 0;
     }
 
+    int32_t margin = 0;
     for (const auto cnstr : params.samplers) {
         switch (cnstr) {
             case COMMON_SAMPLER_TYPE_TOP_K:
-                return params.top_k;
+                return params.top_k + margin;
             case COMMON_SAMPLER_TYPE_PENALTIES:
                 if (params.penalty_last_n != 0 && (params.penalty_repeat != 1.0f || params.penalty_freq != 0.0f || params.penalty_present != 0.0f)) {
-                    return 0;
+                    const bool lowers_only = params.penalty_repeat >= 1.0f && params.penalty_freq >= 0.0f && params.penalty_present >= 0.0f;
+                    if (!lowers_only || params.penalty_last_n < 0 || params.penalty_last_n > 128) {
+                        return 0;
+                    }
+                    margin = params.penalty_last_n;
                 }
                 break;
             case COMMON_SAMPLER_TYPE_DRY:
