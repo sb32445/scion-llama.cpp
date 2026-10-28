@@ -1652,11 +1652,45 @@ struct ggml_cuda_fwht_q8_context {
     // owning context also calls reset() before its pools go away (this member is declared before them).
     ~ggml_cuda_fwht_q8_context() {
         reset();
+        if (arena) {
+            ggml_cuda_set_device(arena_device);
+            cudaFree(arena);
+        }
+    }
+
+    // fixed block for q8_1 rows that later mat-vecs of the same graph reuse (same src1): bump pointer, reset per
+    // graph. The address never changes, so captured CUDA graphs stay valid. nullptr when full: the caller falls back.
+    void * arena = nullptr;
+    int    arena_device = 0;
+    size_t arena_off = 0;
+    static constexpr size_t arena_cap = 8u << 20;
+
+    void * arena_alloc(size_t bytes) {
+        if (!arena) {
+            arena_device = ggml_cuda_get_device();
+            if (cudaMalloc(&arena, arena_cap) != cudaSuccess) {
+                (void) cudaGetLastError();
+                arena = nullptr;
+                arena_off = arena_cap;
+                return nullptr;
+            }
+        }
+        const size_t off = GGML_PAD(arena_off, 256);
+        if (off + bytes > arena_cap) {
+            return nullptr;
+        }
+        arena_off = off + bytes;
+        return (char *) arena + off;
+    }
+
+    bool in_arena(const void * p) const {
+        return arena && (const char *) p >= (const char *) arena && (const char *) p < (const char *) arena + arena_cap;
     }
 
     void reset() {
         entries.clear();
         precomputed.clear();
+        arena_off = arena ? 0 : arena_off;
         while (!held.empty()) {
             held.pop_back();
         }

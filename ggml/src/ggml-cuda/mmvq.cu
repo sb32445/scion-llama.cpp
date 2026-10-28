@@ -1711,9 +1711,21 @@ void ggml_cuda_mul_mat_vec_q(
     }
     // src1 may be a Hadamard transform output whose producer already wrote the q8_1 rows in this
     // exact layout (ggml_cuda_fwht_q8, into src1's buffer or a held pool block); nothing to quantize.
-    const ggml_cuda_fwht_q8 * pre_q8 = ids ? nullptr : ctx.fwht_q8().find(src1);
+    const ggml_cuda_fwht_q8 * pre_q8 = ctx.fwht_q8().find(src1);
+
+    // later mat-vecs of this graph with the same src1 reuse these rows (plain one-column q8_1 only)
+    static const bool share_q8 = [] {
+        const char * env = getenv("GGML_CUDA_Q8_SHARE");
+        return !env || atoi(env) != 0;
+    }();
+    const bool shareable = share_q8 && y_layout == GGML_CUDA_Q8_1_AOS && ne11 == 1 && ne12 == 1 && ne13 == 1;
     if (pre_q8) {
-        GGML_ASSERT(pre_q8->layout == y_layout && pre_q8->ne0 == ne10_padded && pre_q8->ncols == ne11 && ne12 == 1 && ne13 == 1);
+        const bool match = pre_q8->layout == y_layout && pre_q8->ne0 == ne10_padded && pre_q8->ncols == ne11 && ne12 == 1 && ne13 == 1;
+        if (ctx.fwht_q8().in_arena(pre_q8->data) && !match) {
+            pre_q8 = nullptr; // rows of another layout: quantize again
+        } else {
+            GGML_ASSERT(match); // a Hadamard producer always matches
+        }
     }
 
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
@@ -1721,11 +1733,20 @@ void ggml_cuda_mul_mat_vec_q(
     if (pre_q8) {
         src1_q8_1_d = (const char *) pre_q8->data;
     } else {
-        src1_q8_1_d = src1_q8_1.alloc(ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
+        const size_t q8_bytes = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
+        void * shared = shareable ? ctx.fwht_q8().arena_alloc(q8_bytes) : nullptr;
+        if (shared) {
+            src1_q8_1_d = (const char *) shared;
+        } else {
+            src1_q8_1_d = src1_q8_1.alloc(q8_bytes);
+        }
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), y_layout, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        quantize_row_q8_1_cuda(src1_d, nullptr, (void *) src1_q8_1_d, y_layout, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        if (shared) {
+            ctx.fwht_q8().set(src1, { y_layout, ne10_padded, ne11, shared });
+        }
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;
